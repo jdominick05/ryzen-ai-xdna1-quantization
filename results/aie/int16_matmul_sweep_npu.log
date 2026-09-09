@@ -1,0 +1,527 @@
+int16 (A16W16) GEMM on the NPU, measured against int8 and bf16 in the same sitting --
+the "16-bit x 16-bit vector GEMM" throughput number this project's backlog had asked for
+and never taken. The answer is that on this design there is essentially no int16 penalty
+to measure: int16 runs at 0.68-1.04x the int8 rate (median 0.93x) and is
+indistinguishable from bf16 (0.97-1.03x) at every shape, despite issuing a quarter the
+MACs per instruction that int8 does.
+Desktop 2 (Ryzen 7 8700G / Phoenix XDNA1), DESKTOP-CBL5NUA, 2026-09-09, mlir-aie v1.4.2,
+ironenv. All 30 rows one sitting, 16:46-16:52. `xrt-smi examine -r aie-partitions` read
+"No hardware contexts running on device" immediately before and immediately after the
+sitting; both captures are in the raw output below.
+
+WHY THIS EXISTS
+===============
+The backlog item was "A16W8 / A16W16 High-Dynamic-Range INT16 Kernels: benchmark 16-bit
+x 16-bit vector GEMMs on AIE tiles to measure the exact TOPS and throughput penalty vs
+INT8". Two things had to be established before a number meant anything.
+
+First, what the silicon actually offers. AMD's own device.yaml, already read verbatim
+into notes_aie2_device_dtypes.log, gives the AIE2 architecture block (the one mixed into
+`phoenix:`, this chip) macs_per_cycle for exactly three combinations --
+bfloat16xbfloat16 128, int16xint8 128, int8xint8 256 -- and **no int16xint16 entry at
+all**. AIE2p (Strix) has one, at 128. So:
+
+  - **A16W8 (int16 activation x int8 weight) is the natively-specified 16-bit path on
+    this silicon**, at 128 macs/cycle, i.e. exactly half int8xint8's 256. That is the
+    "exact TOPS penalty vs INT8" the item asked for, and it is a SPEC figure, not
+    measured here -- `whole_array.py` takes one `--dtype_in` for both operands, so a
+    mixed int16xint8 GEMM is not expressible in this design and was not run.
+  - **A16W16 has no native MAC combination on AIE2.** Whatever runs is emulation.
+
+Second, whether the emulated path even produces a correct answer, and at what shapes.
+It does not, out of the box -- see the overflow finding below, which is why this log
+carries a local patch rather than just numbers.
+
+The measurement is therefore narrower than the backlog item's phrasing and is stated as
+such: this is the measured throughput of the int16xint16 path `whole_array.py` compiles,
+not a measurement of A16W8, and not a claim about usable dynamic range.
+
+THE OVERFLOW FINDING (why a patch was needed)
+=============================================
+Run unmodified, `--dtype_in i16 --dtype_out i32` FAILs verification at every one of the
+ten shapes, with numpy raising `RuntimeWarning: invalid value encountered in cast` in
+the design's own reference path. This is not a kernel bug and not a hardware bug: it is
+the design's input range against its accumulator width.
+
+`whole_array.py` draws integer inputs from +/-(iinfo(dtype_in).max // 4), and its
+K-reduction accumulates in a `dtype_out`-typed buffer (the same structural fact
+bf16_matmul_k_limit_diagnosed_npu.log found for bf16 output). For int16 that is
++/-8192, so the exact product reaches K * 8192^2 -- 3.4e10 at K=512, against int32's
+2.1e9 ceiling. It overflows from K >= 32, i.e. at every useful GEMM shape. int8 is
+unaffected: +/-31 over K=512 reaches 5e5, and the same bound stays safe to K = 2**21.
+i32 is the widest integer output `whole_array.py` offers, so there is no wider
+accumulator to select.
+
+The fix keeps the shape and narrows the input RANGE instead, to the largest bound whose
+exact product still fits dtype_out: bound = isqrt(iinfo(dtype_out).max / K). Throughput
+is data-independent at fixed shape and dtype, so the timing this produces is the real
+timing; what it costs is dynamic range, and that cost is the honest caveat on the whole
+table:
+
+  K=512  -> +/-2047  (~11 of int16's 15 value bits usable)
+  K=1024 -> +/-1448  (~10.5 bits)
+  K=2048 -> +/-1023  (~10 bits)
+  K=4096 -> +/-724   (~9.5 bits)
+
+So an int16 GEMM that verifies on this design at a transformer-scale K carries about
+9.5-11 usable bits, not 16. "High-dynamic-range INT16" is exactly what the int32
+accumulator does not deliver here. The patch is
+kernels/int8_matmul_sweep/whole_array_int_input_bound.patch, kept beside the existing
+whole_array_int_reference_float64.patch as a local edit to an external file.
+
+The patch changes int8's lower bound from -32 to -31 (it takes a symmetric range). That
+is why the i8 rows below are a control as well as a comparison -- see CONTROL.
+
+WHAT WAS RUN
+============
+kernels/int8_matmul_sweep/npu_matmul_sweep.py, which already took `--dtype i16` and
+needed no change, driving the upstream
+~/mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/whole_array.py
+(v1.4.2, patched as above) once per row: 4 columns, 10 timed iters after 3 warmup, tiles
+m=64/k=64/n=32 unless the row says otherwise. GOPS/GFLOPS = 2MKN / the script's own
+NPU-time bracket average. Verification is the script's own numpy A@B check: exact
+`np.array_equal` for the integer dtypes, a 5% / 0.5 tolerance for bf16. All 30 rows PASS.
+
+All three dtypes were re-measured together rather than read against the numbers already
+in int8_matmul_sweep_npu.log (2026-09-07), because CLAUDE.md's invariant forbids
+comparing an NPU number against one captured on a different day on this machine.
+
+  # one sitting, three dtypes, identical shapes and tiles
+  for dt in i8 i16 bf16:
+    python kernels/int8_matmul_sweep/npu_matmul_sweep.py --dtype $dt --iters 10 --warmup 3 \
+        --shapes 512x512x512,1024x1024x1024,2048x2048x2048,2048x4096x4096,128x4096x4096,\
+                 256x4096x4096,512x4096x4096,1024x4096x4096,512x4096x4096@16,512x4096x4096@32
+  (each row is: whole_array.py --dev npu -M .. -K .. -N .. -m .. -k 64 -n 32 --n-aie-cols 4
+   --dtype_in <i8|i16|bf16> --dtype_out <i32|i32|f32> --warmup 3 --iters 10)
+
+whole_array needs M % (m*4) == 0 and (M/m/4) % 2 == 0, so M=128 forces m=16 and M=256
+forces m=32; the two @16/@32 rows are m-tile controls at a fixed M=512 for exactly that
+reason, carried over from the int8 sweep's shape list.
+
+RESULT
+======
+GOPS for the integer dtypes, GFLOPS for bf16; 2MKN over the same NPU-time bracket in all
+three cases, so the columns are directly comparable.
+
+  MxKxN              m    i8 (i32)   i16 (i32)   bf16 (f32)   i16/i8   i16/bf16
+  ---------------------------------------------------------------------------------
+  512x512x512        64     989.33      848.57       870.98    0.858      0.974
+  1024x1024x1024     64    2680.23     1823.75      1858.23    0.680      0.981
+  2048x2048x2048     64    2401.05     1771.04      1761.70    0.738      1.005
+  2048x4096x4096     64    2053.58     1748.50      1766.13    0.851      0.990
+  128x4096x4096      16     594.56      617.58       600.57    1.039      1.028
+  256x4096x4096      32    1066.46     1064.83      1072.33    0.999      0.993
+  512x4096x4096      64    1878.71     1748.64      1753.27    0.931      0.997
+  1024x4096x4096     64    2038.58     1741.55      1736.64    0.854      1.003
+  512x4096x4096      16     635.19      628.95       628.41    0.990      1.001
+  512x4096x4096      32    1084.82     1077.90      1073.68    0.994      1.004
+
+Three readings, in order of how well the evidence supports them.
+
+1. **There is no 4x int16 penalty, and at half the shapes there is no penalty at all.**
+   The int16 kernel `whole_array.py` selects is `matmul_vectorized_4x4x4_i16_i32` --
+   `aie::mmul<4,4,4,int16,int16>`, 64 MACs per mmul, in a 2x2 expansion. int8 selects
+   `matmul_vectorized_4x8x8_i8_i32` -- `aie::mmul<4,8,8,int8,int8>`, **256 MACs per
+   mmul**, in a 4x2 expansion. Four times the MACs per instruction buys between -4% and
+   +47%, never more. Whatever sets the rate on this design, it is not MAC issue rate.
+
+2. **int16 and bf16 are the same measurement.** Every row agrees within 3%, and the two
+   dtypes have byte-identical L1 footprints (44,288 B against int8's 32,000 B). Two
+   2-byte dtypes with different MAC shapes -- 4x4x4 int16 vs bf16's own -- land on top
+   of each other, while the 1-byte dtype separates only where m is large. That is byte
+   width behaving like the independent variable and MAC shape behaving like noise.
+
+3. **This corroborates, on a third dtype, what the int8 sweep already concluded.**
+   docs/BENCHMARKS.md's int8 section states the default tile is "dtype-blind": the
+   design re-streams all of A from DDR once per column block and all of B once per row
+   block, and the i32/f32 output tile it read-modify-writes is 4 bytes per element
+   whatever the input dtype. int8's 1.1-1.5x over bf16 was the first evidence; int16
+   landing on bf16 rather than between it and int8 is the second, and it is the sharper
+   one, because int16 differs from bf16 in MAC shape while matching it in bytes.
+
+   Where int8 does pull ahead it is at large m (0.68-0.86x at m=64), and where all three
+   converge it is at small m (0.99-1.04x at m=16/32) -- the rows where the m-tile is
+   already the bottleneck, which is consistent with the same explanation.
+
+WHAT THIS DOES NOT ESTABLISH
+============================
+- **Not A16W8.** The natively-specified int16 path (int16xint8, 128 macs/cycle by SPEC)
+  was not measured; `whole_array.py` cannot express a mixed-operand GEMM. A16W8's
+  measured throughput on this silicon remains open, and results/a16w8/ already shows the
+  separate, EP-level reason A16W8 does not reach the NPU through the vendor toolchain
+  (0/394 nodes, an opset-17-vs-21 Q/DQ domain issue, not a hardware limit).
+- **Not a dynamic-range result.** Every int16 row here ran with ~9.5-11 usable value
+  bits, not 16, for the accumulator reason above. An int16 GEMM that actually needs
+  16-bit inputs at K=4096 cannot accumulate in int32 at all, on this design or any
+  other, and nothing here says what it would cost if it could.
+- **Not an explanation.** "Not MAC-bound" is what these numbers rule out, not what they
+  identify. The candidates named in the int8 section -- A re-streaming from DDR, the
+  two-level FIFO handshake per k-step, the 4-byte output tile -- are consistent with
+  this data but are not separated by it. The m=16/32 convergence points at the m-tile
+  as one binding constraint; that is a hint, not an attribution.
+- **Not a CPU comparison.** No CPU int16 GEMM baseline was run. torch has no int16 matmul
+  path comparable to `_int_mm`, so the NPU/CPU verdict that int8 and bf16 both carry is
+  absent for int16 and is not implied by either.
+
+CONTROL
+=======
+The i8 rows in this sitting reproduce int8_matmul_sweep_npu.log's 2026-09-07 numbers at
+every shape, within +0.2% to +4.2% (mostly slightly faster):
+
+  512^3 989.33 vs 982.52 | 1024^3 2680.23 vs 2743.72 | 2048^3 2401.05 vs 2373.66
+  2048x4096x4096 2053.58 vs 2047.66 | 512x4096x4096 1878.71 vs 1875.49
+  1024x4096x4096 2038.58 vs 1956.97 | 128x4096x4096 594.56 vs 585.31
+  256x4096x4096 1066.46 vs 1041.28 | @16 635.19 vs 609.93 | @32 1084.82 vs 1045.84
+
+That is inside this machine's known run-to-run drift, and it does two jobs: it confirms
+the input-bound patch did not perturb int8 (whose bound the patch moves only from -32 to
+-31), and it confirms this sitting is comparable to the earlier one, which is what makes
+the int16 column readable against the int8 history at all.
+
+RAW OUTPUT
+================================================================================
+=== dtype sitting: i8 vs i16 vs bf16, whole_array 4 cols. start 2026-09-09 16:46:21 ===
+host: DESKTOP-CBL5NUA
+
+--- contention check before the sitting ---
+
+-----------------------------
+[003d:00:01.1] : NPU Phoenix
+-----------------------------
+AIE Partitions
+  No hardware contexts running on device
+
+
+################ dtype i8  (16:46:21) ################
+whole_array sweep  dtype i8->i32  cols=4 k=64 n=32  c_single_buffer=0 b_col_maj=0  iters=10 warmup=3  python=C:\Users\<user>\mlir-aie\ironenv\Scripts\python.exe
+whole_array dir: C:\Users\<user>\mlir-aie\programming_examples\basic\matrix_multiplication\whole_array
+
+=== 512x512x512  m=64 k=64 n=32  i8->i32  c_single_buffer=0  L1 est 32,000 B (fits) ===
+$ whole_array.py --dev npu -M 512 -K 512 -N 512 -m 64 -k 64 -n 32 --n-aie-cols 4 --dtype_in i8 --dtype_out i32 --warmup 3 --iters 10
+--- stdout tail ---
+  NPU time     (avg/min/max us): 271.3 / 257.8 / 291.1
+  End-to-end   (avg/min/max us): 876.4 / 778.6 / 1204.3
+  NPU GFLOPS                    : 989.33
+  PASS!
+(wall incl. compile: 0.5 s)
+
+=== 1024x1024x1024  m=64 k=64 n=32  i8->i32  c_single_buffer=0  L1 est 32,000 B (fits) ===
+$ whole_array.py --dev npu -M 1024 -K 1024 -N 1024 -m 64 -k 64 -n 32 --n-aie-cols 4 --dtype_in i8 --dtype_out i32 --warmup 3 --iters 10
+--- stdout tail ---
+  NPU time     (avg/min/max us): 801.2 / 772.9 / 845.5
+  End-to-end   (avg/min/max us): 1354.6 / 1274.2 / 1495.7
+  NPU GFLOPS                    : 2680.23
+  PASS!
+(wall incl. compile: 5.2 s)
+
+=== 2048x2048x2048  m=64 k=64 n=32  i8->i32  c_single_buffer=0  L1 est 32,000 B (fits) ===
+$ whole_array.py --dev npu -M 2048 -K 2048 -N 2048 -m 64 -k 64 -n 32 --n-aie-cols 4 --dtype_in i8 --dtype_out i32 --warmup 3 --iters 10
+--- stdout tail ---
+  NPU time     (avg/min/max us): 7155.2 / 6924.4 / 7386.2
+  End-to-end   (avg/min/max us): 7966.7 / 7482.3 / 8383.1
+  NPU GFLOPS                    : 2401.05
+  PASS!
+(wall incl. compile: 5.5 s)
+
+=== 2048x4096x4096  m=64 k=64 n=32  i8->i32  c_single_buffer=0  L1 est 32,000 B (fits) ===
+$ whole_array.py --dev npu -M 2048 -K 4096 -N 4096 -m 64 -k 64 -n 32 --n-aie-cols 4 --dtype_in i8 --dtype_out i32 --warmup 3 --iters 10
+--- stdout tail ---
+  NPU time     (avg/min/max us): 33463.3 / 33126.8 / 33976.5
+  End-to-end   (avg/min/max us): 34432.7 / 34066.5 / 34875.0
+  NPU GFLOPS                    : 2053.58
+  PASS!
+(wall incl. compile: 1.2 s)
+
+=== 128x4096x4096  m=16 k=64 n=32  i8->i32  c_single_buffer=0  L1 est 13,568 B (fits) ===
+$ whole_array.py --dev npu -M 128 -K 4096 -N 4096 -m 16 -k 64 -n 32 --n-aie-cols 4 --dtype_in i8 --dtype_out i32 --warmup 3 --iters 10
+--- stdout tail ---
+  NPU time     (avg/min/max us): 7223.8 / 7022.3 / 7441.5
+  End-to-end   (avg/min/max us): 8140.1 / 7939.6 / 8415.9
+  NPU GFLOPS                    : 594.56
+  PASS!
+(wall incl. compile: 5.3 s)
+
+=== 256x4096x4096  m=32 k=64 n=32  i8->i32  c_single_buffer=0  L1 est 19,712 B (fits) ===
+$ whole_array.py --dev npu -M 256 -K 4096 -N 4096 -m 32 -k 64 -n 32 --n-aie-cols 4 --dtype_in i8 --dtype_out i32 --warmup 3 --iters 10
+--- stdout tail ---
+  NPU time     (avg/min/max us): 8054.6 / 7795.3 / 8373.2
+  End-to-end   (avg/min/max us): 8966.3 / 8652.5 / 9318.1
+  NPU GFLOPS                    : 1066.46
+  PASS!
+(wall incl. compile: 5.5 s)
+
+=== 512x4096x4096  m=64 k=64 n=32  i8->i32  c_single_buffer=0  L1 est 32,000 B (fits) ===
+$ whole_array.py --dev npu -M 512 -K 4096 -N 4096 -m 64 -k 64 -n 32 --n-aie-cols 4 --dtype_in i8 --dtype_out i32 --warmup 3 --iters 10
+--- stdout tail ---
+  NPU time     (avg/min/max us): 9144.5 / 8703.7 / 10276.4
+  End-to-end   (avg/min/max us): 9940.1 / 9481.2 / 10995.2
+  NPU GFLOPS                    : 1878.71
+  PASS!
+(wall incl. compile: 5.6 s)
+
+=== 1024x4096x4096  m=64 k=64 n=32  i8->i32  c_single_buffer=0  L1 est 32,000 B (fits) ===
+$ whole_array.py --dev npu -M 1024 -K 4096 -N 4096 -m 64 -k 64 -n 32 --n-aie-cols 4 --dtype_in i8 --dtype_out i32 --warmup 3 --iters 10
+--- stdout tail ---
+  NPU time     (avg/min/max us): 16854.8 / 16574.8 / 17164.6
+  End-to-end   (avg/min/max us): 17727.1 / 17252.8 / 18063.2
+  NPU GFLOPS                    : 2038.58
+  PASS!
+(wall incl. compile: 5.6 s)
+
+=== 512x4096x4096  m=16 k=64 n=32  i8->i32  c_single_buffer=0  L1 est 13,568 B (fits) ===
+$ whole_array.py --dev npu -M 512 -K 4096 -N 4096 -m 16 -k 64 -n 32 --n-aie-cols 4 --dtype_in i8 --dtype_out i32 --warmup 3 --iters 10
+--- stdout tail ---
+  NPU time     (avg/min/max us): 27047.0 / 26353.5 / 27699.7
+  End-to-end   (avg/min/max us): 27991.5 / 27308.1 / 28622.6
+  NPU GFLOPS                    : 635.19
+  PASS!
+(wall incl. compile: 5.7 s)
+
+=== 512x4096x4096  m=32 k=64 n=32  i8->i32  c_single_buffer=0  L1 est 19,712 B (fits) ===
+$ whole_array.py --dev npu -M 512 -K 4096 -N 4096 -m 32 -k 64 -n 32 --n-aie-cols 4 --dtype_in i8 --dtype_out i32 --warmup 3 --iters 10
+--- stdout tail ---
+  NPU time     (avg/min/max us): 15836.6 / 15132.2 / 16287.3
+  End-to-end   (avg/min/max us): 16795.2 / 16194.7 / 17164.2
+  NPU GFLOPS                    : 1084.82
+  PASS!
+(wall incl. compile: 5.8 s)
+
+SUMMARY  (i8->i32, 4 cols, k=64 n=32 c_single_buffer=0 b_col_maj=0; GOPS = 2MKN / NPU-bracket avg; L1 est = 2A+2B+C*(1|2)+stack, of 65,536)
+           MxKxN   m   L1 est    verdict   NPU avg us   NPU min us   e2e avg us      GOPS
+-----------------------------------------------------------------------------------------
+     512x512x512  64   32,000       PASS        271.3        257.8        876.4    989.33
+  1024x1024x1024  64   32,000       PASS        801.2        772.9       1354.6   2680.23
+  2048x2048x2048  64   32,000       PASS       7155.2       6924.4       7966.7   2401.05
+  2048x4096x4096  64   32,000       PASS      33463.3      33126.8      34432.7   2053.58
+   128x4096x4096  16   13,568       PASS       7223.8       7022.3       8140.1    594.56
+   256x4096x4096  32   19,712       PASS       8054.6       7795.3       8966.3   1066.46
+   512x4096x4096  64   32,000       PASS       9144.5       8703.7       9940.1   1878.71
+  1024x4096x4096  64   32,000       PASS      16854.8      16574.8      17727.1   2038.58
+   512x4096x4096  16   13,568       PASS      27047.0      26353.5      27991.5    635.19
+   512x4096x4096  32   19,712       PASS      15836.6      15132.2      16795.2   1084.82
+
+################ dtype i16  (16:47:07) ################
+whole_array sweep  dtype i16->i32  cols=4 k=64 n=32  c_single_buffer=0 b_col_maj=0  iters=10 warmup=3  python=C:\Users\<user>\mlir-aie\ironenv\Scripts\python.exe
+whole_array dir: C:\Users\<user>\mlir-aie\programming_examples\basic\matrix_multiplication\whole_array
+
+=== 512x512x512  m=64 k=64 n=32  i16->i32  c_single_buffer=0  L1 est 44,288 B (fits) ===
+$ whole_array.py --dev npu -M 512 -K 512 -N 512 -m 64 -k 64 -n 32 --n-aie-cols 4 --dtype_in i16 --dtype_out i32 --warmup 3 --iters 10
+--- stdout tail ---
+  NPU time     (avg/min/max us): 316.3 / 311.1 / 329.6
+  End-to-end   (avg/min/max us): 827.8 / 809.8 / 864.2
+  NPU GFLOPS                    : 848.57
+  PASS!
+(wall incl. compile: 0.5 s)
+
+=== 1024x1024x1024  m=64 k=64 n=32  i16->i32  c_single_buffer=0  L1 est 44,288 B (fits) ===
+$ whole_array.py --dev npu -M 1024 -K 1024 -N 1024 -m 64 -k 64 -n 32 --n-aie-cols 4 --dtype_in i16 --dtype_out i32 --warmup 3 --iters 10
+--- stdout tail ---
+  NPU time     (avg/min/max us): 1177.5 / 1156.9 / 1228.0
+  End-to-end   (avg/min/max us): 1737.6 / 1644.1 / 2052.1
+  NPU GFLOPS                    : 1823.75
+  PASS!
+(wall incl. compile: 0.5 s)
+
+=== 2048x2048x2048  m=64 k=64 n=32  i16->i32  c_single_buffer=0  L1 est 44,288 B (fits) ===
+$ whole_array.py --dev npu -M 2048 -K 2048 -N 2048 -m 64 -k 64 -n 32 --n-aie-cols 4 --dtype_in i16 --dtype_out i32 --warmup 3 --iters 10
+--- stdout tail ---
+  NPU time     (avg/min/max us): 9700.4 / 9587.0 / 9926.0
+  End-to-end   (avg/min/max us): 10564.9 / 10182.7 / 10766.5
+  NPU GFLOPS                    : 1771.04
+  PASS!
+(wall incl. compile: 0.7 s)
+
+=== 2048x4096x4096  m=64 k=64 n=32  i16->i32  c_single_buffer=0  L1 est 44,288 B (fits) ===
+$ whole_array.py --dev npu -M 2048 -K 4096 -N 4096 -m 64 -k 64 -n 32 --n-aie-cols 4 --dtype_in i16 --dtype_out i32 --warmup 3 --iters 10
+--- stdout tail ---
+  NPU time     (avg/min/max us): 39302.1 / 38596.1 / 41317.3
+  End-to-end   (avg/min/max us): 40262.5 / 39667.2 / 42074.7
+  NPU GFLOPS                    : 1748.50
+  PASS!
+(wall incl. compile: 1.3 s)
+
+=== 128x4096x4096  m=16 k=64 n=32  i16->i32  c_single_buffer=0  L1 est 19,712 B (fits) ===
+$ whole_array.py --dev npu -M 128 -K 4096 -N 4096 -m 16 -k 64 -n 32 --n-aie-cols 4 --dtype_in i16 --dtype_out i32 --warmup 3 --iters 10
+--- stdout tail ---
+  NPU time     (avg/min/max us): 6954.5 / 6900.7 / 7062.2
+  End-to-end   (avg/min/max us): 7757.3 / 7464.5 / 7963.5
+  NPU GFLOPS                    : 617.58
+  PASS!
+(wall incl. compile: 0.9 s)
+
+=== 256x4096x4096  m=32 k=64 n=32  i16->i32  c_single_buffer=0  L1 est 27,904 B (fits) ===
+$ whole_array.py --dev npu -M 256 -K 4096 -N 4096 -m 32 -k 64 -n 32 --n-aie-cols 4 --dtype_in i16 --dtype_out i32 --warmup 3 --iters 10
+--- stdout tail ---
+  NPU time     (avg/min/max us): 8066.9 / 7334.4 / 8414.9
+  End-to-end   (avg/min/max us): 8952.4 / 8080.6 / 9446.9
+  NPU GFLOPS                    : 1064.83
+  PASS!
+(wall incl. compile: 0.9 s)
+
+=== 512x4096x4096  m=64 k=64 n=32  i16->i32  c_single_buffer=0  L1 est 44,288 B (fits) ===
+$ whole_array.py --dev npu -M 512 -K 4096 -N 4096 -m 64 -k 64 -n 32 --n-aie-cols 4 --dtype_in i16 --dtype_out i32 --warmup 3 --iters 10
+--- stdout tail ---
+  NPU time     (avg/min/max us): 9824.7 / 9732.2 / 10096.3
+  End-to-end   (avg/min/max us): 10698.0 / 10413.3 / 11050.9
+  NPU GFLOPS                    : 1748.64
+  PASS!
+(wall incl. compile: 1.4 s)
+
+=== 1024x4096x4096  m=64 k=64 n=32  i16->i32  c_single_buffer=0  L1 est 44,288 B (fits) ===
+$ whole_array.py --dev npu -M 1024 -K 4096 -N 4096 -m 64 -k 64 -n 32 --n-aie-cols 4 --dtype_in i16 --dtype_out i32 --warmup 3 --iters 10
+--- stdout tail ---
+  NPU time     (avg/min/max us): 19729.4 / 19601.6 / 19848.5
+  End-to-end   (avg/min/max us): 20810.1 / 20556.6 / 21092.7
+  NPU GFLOPS                    : 1741.55
+  PASS!
+(wall incl. compile: 1.4 s)
+
+=== 512x4096x4096  m=16 k=64 n=32  i16->i32  c_single_buffer=0  L1 est 19,712 B (fits) ===
+$ whole_array.py --dev npu -M 512 -K 4096 -N 4096 -m 16 -k 64 -n 32 --n-aie-cols 4 --dtype_in i16 --dtype_out i32 --warmup 3 --iters 10
+--- stdout tail ---
+  NPU time     (avg/min/max us): 27315.2 / 26923.2 / 27609.6
+  End-to-end   (avg/min/max us): 28203.8 / 27630.0 / 28599.5
+  NPU GFLOPS                    : 628.95
+  PASS!
+(wall incl. compile: 1.0 s)
+
+=== 512x4096x4096  m=32 k=64 n=32  i16->i32  c_single_buffer=0  L1 est 27,904 B (fits) ===
+$ whole_array.py --dev npu -M 512 -K 4096 -N 4096 -m 32 -k 64 -n 32 --n-aie-cols 4 --dtype_in i16 --dtype_out i32 --warmup 3 --iters 10
+--- stdout tail ---
+  NPU time     (avg/min/max us): 15938.3 / 14345.3 / 16635.2
+  End-to-end   (avg/min/max us): 16838.4 / 15011.9 / 17690.3
+  NPU GFLOPS                    : 1077.90
+  PASS!
+(wall incl. compile: 1.0 s)
+
+SUMMARY  (i16->i32, 4 cols, k=64 n=32 c_single_buffer=0 b_col_maj=0; GOPS = 2MKN / NPU-bracket avg; L1 est = 2A+2B+C*(1|2)+stack, of 65,536)
+           MxKxN   m   L1 est    verdict   NPU avg us   NPU min us   e2e avg us      GOPS
+-----------------------------------------------------------------------------------------
+     512x512x512  64   44,288       PASS        316.3        311.1        827.8    848.57
+  1024x1024x1024  64   44,288       PASS       1177.5       1156.9       1737.6   1823.75
+  2048x2048x2048  64   44,288       PASS       9700.4       9587.0      10564.9   1771.04
+  2048x4096x4096  64   44,288       PASS      39302.1      38596.1      40262.5   1748.50
+   128x4096x4096  16   19,712       PASS       6954.5       6900.7       7757.3    617.58
+   256x4096x4096  32   27,904       PASS       8066.9       7334.4       8952.4   1064.83
+   512x4096x4096  64   44,288       PASS       9824.7       9732.2      10698.0   1748.64
+  1024x4096x4096  64   44,288       PASS      19729.4      19601.6      20810.1   1741.55
+   512x4096x4096  16   19,712       PASS      27315.2      26923.2      28203.8    628.95
+   512x4096x4096  32   27,904       PASS      15938.3      14345.3      16838.4   1077.90
+
+################ dtype bf16  (16:47:16) ################
+whole_array sweep  dtype bf16->f32  cols=4 k=64 n=32  c_single_buffer=0 b_col_maj=0  iters=10 warmup=3  python=C:\Users\<user>\mlir-aie\ironenv\Scripts\python.exe
+whole_array dir: C:\Users\<user>\mlir-aie\programming_examples\basic\matrix_multiplication\whole_array
+
+=== 512x512x512  m=64 k=64 n=32  bf16->f32  c_single_buffer=0  L1 est 44,288 B (fits) ===
+$ whole_array.py --dev npu -M 512 -K 512 -N 512 -m 64 -k 64 -n 32 --n-aie-cols 4 --dtype_in bf16 --dtype_out f32 --warmup 3 --iters 10
+--- stdout tail ---
+  NPU time     (avg/min/max us): 308.2 / 300.9 / 335.8
+  End-to-end   (avg/min/max us): 819.5 / 787.5 / 917.3
+  NPU GFLOPS                    : 870.98
+  PASS!
+(wall incl. compile: 5.2 s)
+
+=== 1024x1024x1024  m=64 k=64 n=32  bf16->f32  c_single_buffer=0  L1 est 44,288 B (fits) ===
+$ whole_array.py --dev npu -M 1024 -K 1024 -N 1024 -m 64 -k 64 -n 32 --n-aie-cols 4 --dtype_in bf16 --dtype_out f32 --warmup 3 --iters 10
+--- stdout tail ---
+  NPU time     (avg/min/max us): 1155.7 / 1123.7 / 1209.6
+  End-to-end   (avg/min/max us): 1787.8 / 1654.7 / 2123.6
+  NPU GFLOPS                    : 1858.23
+  PASS!
+(wall incl. compile: 0.5 s)
+
+=== 2048x2048x2048  m=64 k=64 n=32  bf16->f32  c_single_buffer=0  L1 est 44,288 B (fits) ===
+$ whole_array.py --dev npu -M 2048 -K 2048 -N 2048 -m 64 -k 64 -n 32 --n-aie-cols 4 --dtype_in bf16 --dtype_out f32 --warmup 3 --iters 10
+--- stdout tail ---
+  NPU time     (avg/min/max us): 9751.9 / 9546.5 / 10288.7
+  End-to-end   (avg/min/max us): 10690.6 / 10469.9 / 11328.8
+  NPU GFLOPS                    : 1761.70
+  PASS!
+(wall incl. compile: 0.7 s)
+
+=== 2048x4096x4096  m=64 k=64 n=32  bf16->f32  c_single_buffer=0  L1 est 44,288 B (fits) ===
+$ whole_array.py --dev npu -M 2048 -K 4096 -N 4096 -m 64 -k 64 -n 32 --n-aie-cols 4 --dtype_in bf16 --dtype_out f32 --warmup 3 --iters 10
+--- stdout tail ---
+  NPU time     (avg/min/max us): 38909.5 / 38755.9 / 39103.9
+  End-to-end   (avg/min/max us): 39904.0 / 39742.5 / 40147.0
+  NPU GFLOPS                    : 1766.13
+  PASS!
+(wall incl. compile: 1.8 s)
+
+=== 128x4096x4096  m=16 k=64 n=32  bf16->f32  c_single_buffer=0  L1 est 19,712 B (fits) ===
+$ whole_array.py --dev npu -M 128 -K 4096 -N 4096 -m 16 -k 64 -n 32 --n-aie-cols 4 --dtype_in bf16 --dtype_out f32 --warmup 3 --iters 10
+--- stdout tail ---
+  NPU time     (avg/min/max us): 7151.5 / 6960.7 / 7221.1
+  End-to-end   (avg/min/max us): 7954.3 / 7579.7 / 8132.6
+  NPU GFLOPS                    : 600.57
+  PASS!
+(wall incl. compile: 5.3 s)
+
+=== 256x4096x4096  m=32 k=64 n=32  bf16->f32  c_single_buffer=0  L1 est 27,904 B (fits) ===
+$ whole_array.py --dev npu -M 256 -K 4096 -N 4096 -m 32 -k 64 -n 32 --n-aie-cols 4 --dtype_in bf16 --dtype_out f32 --warmup 3 --iters 10
+--- stdout tail ---
+  NPU time     (avg/min/max us): 8010.5 / 7401.1 / 8342.3
+  End-to-end   (avg/min/max us): 8963.1 / 8446.8 / 9246.9
+  NPU GFLOPS                    : 1072.33
+  PASS!
+(wall incl. compile: 5.4 s)
+
+=== 512x4096x4096  m=64 k=64 n=32  bf16->f32  c_single_buffer=0  L1 est 44,288 B (fits) ===
+$ whole_array.py --dev npu -M 512 -K 4096 -N 4096 -m 64 -k 64 -n 32 --n-aie-cols 4 --dtype_in bf16 --dtype_out f32 --warmup 3 --iters 10
+--- stdout tail ---
+  NPU time     (avg/min/max us): 9798.7 / 9748.5 / 9900.3
+  End-to-end   (avg/min/max us): 10719.7 / 10395.1 / 10956.2
+  NPU GFLOPS                    : 1753.27
+  PASS!
+(wall incl. compile: 5.3 s)
+
+=== 1024x4096x4096  m=64 k=64 n=32  bf16->f32  c_single_buffer=0  L1 est 44,288 B (fits) ===
+$ whole_array.py --dev npu -M 1024 -K 4096 -N 4096 -m 64 -k 64 -n 32 --n-aie-cols 4 --dtype_in bf16 --dtype_out f32 --warmup 3 --iters 10
+--- stdout tail ---
+  NPU time     (avg/min/max us): 19785.2 / 19519.3 / 20137.4
+  End-to-end   (avg/min/max us): 20699.1 / 20370.6 / 20939.6
+  NPU GFLOPS                    : 1736.64
+  PASS!
+(wall incl. compile: 5.6 s)
+
+=== 512x4096x4096  m=16 k=64 n=32  bf16->f32  c_single_buffer=0  L1 est 19,712 B (fits) ===
+$ whole_array.py --dev npu -M 512 -K 4096 -N 4096 -m 16 -k 64 -n 32 --n-aie-cols 4 --dtype_in bf16 --dtype_out f32 --warmup 3 --iters 10
+--- stdout tail ---
+  NPU time     (avg/min/max us): 27338.6 / 26996.8 / 27768.1
+  End-to-end   (avg/min/max us): 28311.6 / 27979.3 / 28661.3
+  NPU GFLOPS                    : 628.41
+  PASS!
+(wall incl. compile: 5.7 s)
+
+=== 512x4096x4096  m=32 k=64 n=32  bf16->f32  c_single_buffer=0  L1 est 27,904 B (fits) ===
+$ whole_array.py --dev npu -M 512 -K 4096 -N 4096 -m 32 -k 64 -n 32 --n-aie-cols 4 --dtype_in bf16 --dtype_out f32 --warmup 3 --iters 10
+--- stdout tail ---
+  NPU time     (avg/min/max us): 16001.0 / 15405.3 / 16327.9
+  End-to-end   (avg/min/max us): 16811.5 / 16076.5 / 17212.1
+  NPU GFLOPS                    : 1073.68
+  PASS!
+(wall incl. compile: 5.7 s)
+
+SUMMARY  (bf16->f32, 4 cols, k=64 n=32 c_single_buffer=0 b_col_maj=0; GFLOPS = 2MKN / NPU-bracket avg; L1 est = 2A+2B+C*(1|2)+stack, of 65,536)
+           MxKxN   m   L1 est    verdict   NPU avg us   NPU min us   e2e avg us    GFLOPS
+-----------------------------------------------------------------------------------------
+     512x512x512  64   44,288       PASS        308.2        300.9        819.5    870.98
+  1024x1024x1024  64   44,288       PASS       1155.7       1123.7       1787.8   1858.23
+  2048x2048x2048  64   44,288       PASS       9751.9       9546.5      10690.6   1761.70
+  2048x4096x4096  64   44,288       PASS      38909.5      38755.9      39904.0   1766.13
+   128x4096x4096  16   19,712       PASS       7151.5       6960.7       7954.3    600.57
+   256x4096x4096  32   27,904       PASS       8010.5       7401.1       8963.1   1072.33
+   512x4096x4096  64   44,288       PASS       9798.7       9748.5      10719.7   1753.27
+  1024x4096x4096  64   44,288       PASS      19785.2      19519.3      20699.1   1736.64
+   512x4096x4096  16   19,712       PASS      27338.6      26996.8      28311.6    628.41
+   512x4096x4096  32   27,904       PASS      16001.0      15405.3      16811.5   1073.68
+
+--- contention check after the sitting ---
+
+-----------------------------
+[003d:00:01.1] : NPU Phoenix
+-----------------------------
+AIE Partitions
+  No hardware contexts running on device
+
+=== end 2026-09-09 16:47:58 ===

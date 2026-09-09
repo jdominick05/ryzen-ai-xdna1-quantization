@@ -1,0 +1,53 @@
+Local edit to the external mlir-aie clone, kept here the same way
+whole_array_int_reference_float64.patch is: it is NOT part of this repo's tree and is
+lost on a `git pull` of mlir-aie, so re-apply it before re-running the int16 sweep.
+
+Why: whole_array.py draws integer inputs from +/-(iinfo(dtype_in).max // 4) while its
+K-reduction accumulates in a dtype_out-typed buffer. For int16 that is +/-8192, so the
+exact product reaches K * 8192^2 -- 3.4e10 at K=512 against int32's 2.1e9 ceiling. Every
+i16 -> i32 row FAILs verification from K >= 32, with numpy's own reference raising
+"RuntimeWarning: invalid value encountered in cast". i32 is the widest integer output the
+design offers, so there is no wider accumulator to select instead. int8 is unaffected
+(+/-31 over K=512 reaches 5e5, safe to K = 2**21).
+
+This narrows the input RANGE rather than the K range, to the largest bound whose exact
+product still fits dtype_out. Throughput is data-independent at fixed shape and dtype, so
+the timing is unaffected; what it costs is dynamic range (~9.5-11 usable int16 value bits
+at K=512..4096 rather than 16), which is recorded as the standing caveat on
+results/aie/int16_matmul_sweep_npu.log.
+
+Note it also moves int8's lower bound from -32 to -31, since the range becomes symmetric.
+The i8 control rows in that log reproduce the unpatched 2026-09-07 int8 numbers within
++0.2% to +4.2%, which is what establishes that this does not perturb the int8 comparison.
+
+diff --git a/programming_examples/basic/matrix_multiplication/whole_array/whole_array.py b/programming_examples/basic/matrix_multiplication/whole_array/whole_array.py
+--- a/programming_examples/basic/matrix_multiplication/whole_array/whole_array.py
++++ b/programming_examples/basic/matrix_multiplication/whole_array/whole_array.py
+@@ -565,11 +565,24 @@
+     if np.issubdtype(dtype_in, np.integer):
+         info = np.iinfo(dtype_in)
+-        A_np = rng.integers(
+-            info.min // 4, info.max // 4, size=(opts.M, opts.K), dtype=dtype_in
+-        )
++        # The K-reduction accumulates in a dtype_out-typed buffer, so the exact product
++        # K * max|a| * max|b| has to fit dtype_out or BOTH the hardware and the numpy
++        # reference overflow -- the reference visibly, as an "invalid value encountered
++        # in cast" RuntimeWarning followed by a FAIL. The upstream +/-(max/4) bound is
++        # safe for i8 -> i32 (good to K = 2**21) but overflows i32 for i16 inputs from
++        # K >= 32, i.e. at every useful GEMM shape. Narrow the input RANGE rather than
++        # the K range, so a real shape stays measurable; throughput is data-independent
++        # at fixed shape and dtype, so the timing this produces is still the real one.
++        bound = info.max // 4
++        if np.issubdtype(dtype_out, np.integer):
++            q = int(np.iinfo(dtype_out).max) // max(1, opts.K)
++            b = int(q**0.5)
++            if b * b > q:
++                b -= 1
++            bound = max(1, min(bound, b))
++        A_np = rng.integers(-bound, bound, size=(opts.M, opts.K), dtype=dtype_in)
+         B_shape = (opts.N, opts.K) if opts.b_col_maj else (opts.K, opts.N)
+-        B_np = rng.integers(info.min // 4, info.max // 4, size=B_shape, dtype=dtype_in)
++        B_np = rng.integers(-bound, bound, size=B_shape, dtype=dtype_in)
+     else:
+         A_np = (rng.random((opts.M, opts.K)) * 4.0).astype(dtype_in)
+         B_shape = (opts.N, opts.K) if opts.b_col_maj else (opts.K, opts.N)

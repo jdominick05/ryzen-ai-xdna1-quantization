@@ -651,6 +651,28 @@ got the same oracle. Patching `whole_array.py` changes its JIT-cache hash, so th
 each config recompiles (seconds). CPU timings were taken beside another session's yolov6n
 evaluation runs. Cited by [`kernels/README.md`](../../kernels/README.md).
 
+**`int16_matmul_sweep_npu.log`** — the 16-bit GEMM throughput the backlog had asked for,
+and the finding that the question was half mis-posed. AMD's own `device.yaml`
+(`notes_aie2_device_dtypes.log`) gives AIE2 **no `int16xint16` MAC at all** — the 16-bit
+combination this silicon specifies is `int16xint8` at 128 macs/cycle, half `int8xint8`'s
+256 — so A16W16 on Phoenix is emulation, and A16W8 (the native one) is not expressible in
+`whole_array.py`, which takes a single `--dtype_in`. The emulated path also FAILs
+verification at every shape out of the box: inputs at ±(max//4) = ±8192 against a
+`dtype_out`-typed K-reduction overflow int32 from K ≥ 32.
+`kernels/int8_matmul_sweep/whole_array_int_input_bound.patch` narrows the input range to
+`isqrt(iinfo(dtype_out).max / K)` instead, which keeps the timing honest (throughput is
+data-independent) at the cost of dynamic range — **~9.5–11 usable int16 value bits, not
+16**, which is the standing caveat on the whole log. With that, i8/i16/bf16 re-measured
+in **one sitting** (the 2026-09-07 int8 numbers are a different day, so they are a
+control here, not a comparison — they reproduce within +0.2% to +4.2%), 30/30 PASS:
+**int16 runs at 0.68–1.04× int8 (median 0.93×) where the instruction mix predicts 4×**
+(`aie::mmul<4,4,4,int16,int16>`, 64 MACs, vs `aie::mmul<4,8,8,int8,int8>`, 256), and is
+**indistinguishable from bf16** (0.97–1.03× on every row, byte-identical 44,288 B L1).
+A third dtype confirming the int8 section's "dtype-blind default tile", and the sharpest
+of the three, since int16 differs from bf16 in MAC shape while matching it in bytes.
+Written up in
+[`docs/BENCHMARKS.md`](../../docs/BENCHMARKS.md#int16-gemm-a-quarter-the-macs-per-instruction-and-the-same-throughput).
+
 ## Dispatch floor and the int8 conv verdict
 
 **`conv_issue_rate_decomposed.log`** — the measurement objective K1 asked for and that no

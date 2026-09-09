@@ -14,7 +14,11 @@ This is a narrow target, and most of the narrowness is not optional.
 - **Hawk Point or Phoenix** (XDNA1, `AMD_AIE2_4x4_Overlay`, provider option
   `target: "X1"`). Strix is a different architecture and none of the firmware paths
   here apply to it.
-- **Windows.** XDNA1 has no Linux userspace.
+- **Windows.** This repo's toolchain is Windows-only — Ryzen AI 1.7.1, the VitisAI EP
+  and the VOE runtime all ship for Windows — so every number here is a Windows number.
+  That bounds the toolchain, not the silicon: the upstream Linux kernel does carry an
+  in-tree `amdxdna` driver covering Phoenix. No machine in this project's fleet runs
+  Linux, so that path is untested here rather than known-absent.
 - **Ryzen AI 1.7.1 for inference.** Not 1.8.0 — see [Key findings](BENCHMARKS.md#key-findings).
 - **PowerShell**, not cmd. The scripts print resolved paths at startup so you can see
   when an environment variable did not take.
@@ -157,8 +161,9 @@ cleanup, so the usual answer is one command:
 ./scripts/diag.sh           # what the VitisAI EP actually took
 ```
 
-Run them from **Git Bash**, not WSL — the XDNA1 NPU has no Linux userspace, so a
-WSL run would silently be CPU-only. Every script takes `--help`. Logs land in
+Run them from **Git Bash**, not WSL — the Ryzen AI 1.7.1 / VitisAI EP stack these
+scripts drive is installed for Windows only, so a WSL run finds no NPU provider and is
+silently CPU-only rather than an error. Every script takes `--help`. Logs land in
 `results/`, in UTF-8; PowerShell's `*>` writes UTF-16, which makes later greps
 silently match nothing.
 

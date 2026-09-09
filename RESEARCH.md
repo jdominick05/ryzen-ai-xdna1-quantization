@@ -637,6 +637,15 @@ been closed:
   Strix's `AIE2p` block, for contrast, adds `bfp16` and `int16xint16`/`int8xint4`
   combinations AIE2 lacks and roughly doubles most throughput figures — an asymmetry
   that is itself evidence this is a real per-chip table, not a copy-pasted default.
+  **Measured follow-up (2026-09-09):** the missing `int16xint16` entry is not academic —
+  `whole_array.py` still compiles an int16 GEMM for Phoenix, out of a 4×4×4 `aie::mmul`
+  carrying 64 MACs against int8's 4×8×8 and 256. It runs at **0.68–1.04× the int8 rate
+  and within 3% of bf16 at every shape**, i.e. a quarter of the MAC throughput costs
+  nothing measurable, because this design's default tile is bound by byte width and A
+  re-streaming rather than by MAC issue rate. It also does not verify at all until the
+  input range is narrowed to fit the int32 accumulator (~9.5–11 usable value bits at
+  K = 512…4096), which is the concrete sense in which "high-dynamic-range INT16" is not
+  available on this path. `results/aie/int16_matmul_sweep_npu.log`.
   **Checked whether an actual custom kernel could be built and run on Phoenix from
   material already in this install — a real dead end, confirmed rather than assumed.**
   The same `waic` wheel also bundles `aie4_models/`, a large internal AMD kernel-source

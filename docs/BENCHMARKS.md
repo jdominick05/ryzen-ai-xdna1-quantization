@@ -1371,6 +1371,82 @@ int8 gains at +4%; its ranking was right and its sizes were not.)
 accumulator — not a flag); m=128 at N=4096 (the 2.6 stride cap); 32×64 and 32×32; int8 across
 shapes; `--b-col-maj` at other shapes; whether 32/64/128 keeps its lead below M=1024.
 
+### int16 GEMM: a quarter the MACs per instruction, and the same throughput
+
+The backlog asked for "the exact TOPS and throughput penalty vs INT8" for 16-bit GEMM.
+Two facts had to come first, and the first one narrows the question.
+
+AMD's own `device.yaml`, read verbatim into `results/aie/notes_aie2_device_dtypes.log`,
+gives the AIE2 block mixed into `phoenix:` — this chip — `macs_per_cycle` for exactly
+three combinations: `bfloat16xbfloat16` 128, `int16xint8` 128, `int8xint8` 256. There is
+**no `int16xint16` entry at all**; AIE2p (Strix) has one, at 128. So on this silicon
+**A16W8 is the natively-specified 16-bit path, at half int8's MAC rate** (SPEC, not
+measured here — `whole_array.py` takes one `--dtype_in` for both operands, so a mixed
+int16×int8 GEMM is not expressible in that design and was not run), and **A16W16 has no
+native MAC combination**: whatever runs is emulation.
+
+The second fact is that the emulated path does not verify out of the box. `--dtype_in
+i16 --dtype_out i32` FAILs at all ten shapes, with numpy's own reference raising
+`invalid value encountered in cast`. It is neither a kernel nor a hardware bug: the
+design draws integer inputs from ±(max//4) — ±8192 for int16 — while its K-reduction
+accumulates in a `dtype_out`-typed buffer, so the exact product reaches K·8192² = 3.4e10
+at K=512 against int32's 2.1e9. It overflows from K ≥ 32, and i32 is the widest integer
+output the design offers. `kernels/int8_matmul_sweep/whole_array_int_input_bound.patch`
+narrows the input *range* instead of the K range, to `isqrt(iinfo(dtype_out).max / K)`.
+Throughput is data-independent at fixed shape and dtype, so the timing is real; the cost
+is dynamic range, and it is the standing caveat here — **every int16 row below ran with
+~9.5–11 usable value bits, not 16.** "High-dynamic-range INT16" is precisely what an
+int32 accumulator does not deliver at these K.
+
+All three dtypes were re-measured in one sitting (2026-09-09, Desktop 2, 16:46–16:52,
+device idle before and after) rather than read against the 2026-09-07 int8 numbers,
+per this file's own cross-session drift invariant. All 30 rows PASS — bit-exact
+`np.array_equal` for the integer dtypes. `results/aie/int16_matmul_sweep_npu.log`.
+
+| MxKxN | m | i8 GOPS | i16 GOPS | bf16 GFLOPS | i16/i8 | i16/bf16 |
+|---|---|---|---|---|---|---|
+| 512³ | 64 | 989.33 | 848.57 | 870.98 | 0.86× | 0.97× |
+| 1024³ | 64 | 2680.23 | 1823.75 | 1858.23 | 0.68× | 0.98× |
+| 2048³ | 64 | 2401.05 | 1771.04 | 1761.70 | 0.74× | 1.01× |
+| 2048×4096×4096 | 64 | 2053.58 | 1748.50 | 1766.13 | 0.85× | 0.99× |
+| 128×4096×4096 | 16 | 594.56 | 617.58 | 600.57 | 1.04× | 1.03× |
+| 256×4096×4096 | 32 | 1066.46 | 1064.83 | 1072.33 | 1.00× | 0.99× |
+| 512×4096×4096 | 64 | 1878.71 | 1748.64 | 1753.27 | 0.93× | 1.00× |
+| 1024×4096×4096 | 64 | 2038.58 | 1741.55 | 1736.64 | 0.85× | 1.00× |
+| 512×4096×4096 | 16 | 635.19 | 628.95 | 628.41 | 0.99× | 1.00× |
+| 512×4096×4096 | 32 | 1084.82 | 1077.90 | 1073.68 | 0.99× | 1.00× |
+
+**The measured penalty is 0.68–1.04× (median 0.93×), where the instruction mix predicts
+4×.** `whole_array.py` selects `matmul_vectorized_4x4x4_i16_i32` for int16 —
+`aie::mmul<4,4,4,int16,int16>`, **64 MACs per mmul** — against
+`matmul_vectorized_4x8x8_i8_i32` for int8 — `aie::mmul<4,8,8,int8,int8>`, **256 MACs per
+mmul**. Four times the MACs per instruction buys between −4% and +47%, never more.
+Whatever sets the rate here, it is not MAC issue rate.
+
+**int16 and bf16 are the same measurement**, agreeing within 3% on every row, with
+byte-identical L1 footprints (44,288 B against int8's 32,000 B). Two 2-byte dtypes with
+different MAC shapes land on top of each other while the 1-byte dtype separates only
+where m is large. That is byte width behaving like the independent variable and MAC
+shape behaving like noise — a third dtype agreeing with the "dtype-blind default tile"
+reading the int8 section above arrived at, and the sharpest of the three, because int16
+differs from bf16 in MAC shape while matching it in bytes.
+
+**What this does not establish.** Not A16W8 — the natively-specified path was not
+measured, and `results/a16w8/` documents the separate EP-level reason it does not reach
+the NPU through the vendor toolchain (0/394 nodes, an opset-17-vs-21 Q/DQ domain issue,
+not a hardware limit). Not a dynamic-range result, per the ~9.5–11 bit caveat above. Not
+an attribution: "not MAC-bound" is what these rows rule out, not what they identify — the
+candidates named in the int8 section (A re-streaming from DDR, the two-level FIFO
+handshake per k-step, the 4-byte output tile) are consistent with this data but are not
+separated by it, and the m=16/32 convergence points at the m-tile as one binding
+constraint without isolating it. No CPU int16 baseline was run, so the NPU/CPU verdict
+int8 and bf16 both carry is absent here and is not implied by either.
+
+**Control:** the i8 rows in this sitting reproduce the 2026-09-07 sweep at every shape
+within +0.2% to +4.2% — inside this machine's known drift. That confirms both that the
+input-bound patch does not perturb int8 (whose bound it moves only from −32 to −31) and
+that this sitting is readable against the earlier one.
+
 ### The AIE core clock, measured: 1.80 GHz default, 0.80 powersaver
 
 Every per-second ceiling this repo derives for the array — TOPS per column, bytes per
@@ -6697,8 +6773,12 @@ establishes vendor parity — the oracle diff remains that gate — and neither 
   (XDNA1) via Ryzen AI 1.7.1 specifically. Strix (XDNA2) uses a different xclbin and
   compiler target and has not been touched; 1.8.0 cannot run inference on this chip at
   all (no Phoenix xclbin — see [Key findings](#key-findings)).
-- **Windows only.** XDNA1 has no Linux userspace; a WSL run is silently CPU-only rather
-  than an error, which is the kind of failure that's easy to miss.
+- **Windows only.** The Ryzen AI 1.7.1 / VitisAI EP stack every number here was measured
+  through ships for Windows only, so a WSL run finds no NPU provider and is silently
+  CPU-only rather than an error — the kind of failure that's easy to miss. This bounds
+  the toolchain, not the silicon: the upstream Linux kernel carries an in-tree `amdxdna`
+  driver covering Phoenix, but no machine in this project's fleet runs Linux, so that
+  path is untested here rather than known-absent.
 - **The full-graph YOLOv8 model is refused by the EP, on purpose left that way.** It's
   kept in the repo as the control proving the head-cut fix is real — see
   [The YOLOv8n blocker](#the-yolov8n-blocker-and-how-it-was-solved) — not a bug to fix.
