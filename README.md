@@ -175,13 +175,13 @@ array natively does bf16; Quark and the VitisAI EP just don't expose it. The ope
 
 Outcomes, mostly negative and all measured:
 
-- **bf16 GEMM is the first genuine NPU win in this project.** 2072.5 GFLOPS at 1024³
-  against CPU bf16's 1161.2 — the NPU wins 1.18×–1.78× once M/N ≥ 1024, and loses at
-  512³ (895.1 vs 1100.6). "`K ≥ 3072` fails" was the reduction loop accumulating in
-  `dtype_out` instead of fp32; `--dtype_out f32` fixes it free, and **the win holds at a
-  7B-model projection shape** (M2048/K4096/N4096, 1.33×) — but a real FFN hinges on
-  `d_ff`'s factorization: Llama-2-7B (`d_ff=11008`) flips it to **1.10× CPU**, Mistral-7B
-  (`d_ff=14336`) keeps **1.13× NPU**. `attention_bf16`'s own kernel never had this bug.
+- **bf16 GEMM is the first genuine NPU win in this project.** 2072.5 GFLOPS at 1024³ vs CPU
+  bf16's 1161.2 — 1.18×–1.78× once M/N ≥ 1024, losing at 512³ (895.1 vs 1100.6). "`K ≥ 3072`
+  fails" was the reduction accumulating in `dtype_out`, not fp32; `--dtype_out f32` fixes it
+  free, and the win holds at a 7B projection shape (M2048/K4096/N4096, **1.33×**) — but a real
+  FFN hinges on `d_ff`: Llama-2-7B (11008) flips to **1.10× CPU**, Mistral-7B (14336) **1.13× NPU**.
+- **int16 costs nothing against int8 — and AIE2 has no `int16xint16` MAC at all.** 0.68×–1.04×
+  int8, within 3% of bf16, on a quarter the MACs per instruction: the default tile is dtype-blind.
 - **int8 GEMM wins too, but only with a tile bf16 couldn't fit — until it could.** At the
   default tile the NPU's headline dtype **loses** to CPU's own int8 kernel almost everywhere;
   `n=64` fits int8's half-size tiles for **4448–4607 GOPS**, a **1.10×–1.83× win at M ≥ 512,
