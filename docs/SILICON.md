@@ -63,7 +63,7 @@ New numbers use 1.80 GHz and say which power mode they were taken in.
 | Program memory | 16 KB | SPEC: `device.yaml` `core_program_memory: 16`. |
 | MACs per cycle | int8×int8 **256**; bf16×bf16 **128**; int16×int8 **128** | SPEC: `device.yaml` AIE2 `macs_per_cycle`. |
 | Adds per cycle | int8, int4: 64; bf16, int16: 32 | SPEC: `device.yaml` AIE2 `adds_per_cycle`. |
-| Absent from the table | int16×int16, int8×int4, int16×int4, bfp16×bfp16 | SPEC: those appear only in the AIE2p (Strix) block. **"Absent from the table" is not "absent from the silicon", and for int16×int16 it is now known not to be** — MEASURED: the compiled int16 GEMM core ELF issues plain `vmac cm, cm, x, x, r`, identical in form to int8's, with no `vshift`/`vadd`/`vsrs` emulation sequence, so `int16xint16` is a real AIE2 MAC at shape `4x4x4` = 64 per `vmac` (`results/aie/int16_matmul_sweep_npu.log`, CORRECTION appendix). `device.yaml` is OGOAT's cost model, not an ISA reference; treat the other three absences as untested rather than refuted. No vector fp32 multiply path is listed either; fp32 *accumulation* is native (`accfloat`), and `kernels/groupnorm_bf16/groupnorm_kernels.cc` gets fp32-grade products by splitting a coefficient into a bf16 hi part and a bf16 residual — two MACs, not one. |
+| Absent from the table | int16×int16, int8×int4, int16×int4, bfp16×bfp16 | SPEC: those appear only in the AIE2p (Strix) block. **"Absent from the table" is not "absent from the silicon", and for int16×int16 it is now known not to be.** MEASURED (disassembly): the compiled int16 GEMM core ELF issues plain `vmac cm, cm, x, x, r`, identical in form to int8's, with no `vshift`/`vadd`/`vsrs` emulation sequence anywhere — one `vmac` per mmul, so `int16xint16` is a real AIE2 MAC instruction. DERIVED: its width is `4x4x4` = 64 MACs per `vmac`, from the mmul shape in the row below, exactly as int8's 256 is derived there — not read off an ISA table, and this repo has none listing per-dtype `vmac` retire widths. (`results/aie/int16_matmul_sweep_npu.log`, CORRECTION appendix.) `device.yaml` is OGOAT's cost model, not an ISA reference; treat the other three absences as untested rather than refuted. No vector fp32 multiply path is listed either; fp32 *accumulation* is native (`accfloat`), and `kernels/groupnorm_bf16/groupnorm_kernels.cc` gets fp32-grade products by splitting a coefficient into a bf16 hi part and a bf16 residual — two MACs, not one. |
 | Vector load/store bus | 256 bits | SPEC: `getComputeTileLoadStoreBusWidth() = 256`. |
 | Accumulator cascade to a neighbour | 512 bits | SPEC: `getAccumulatorCascadeSize() = 512`. Exercised on this chip by `02_vector_reduce_max`'s 4-core cascade (`results/aie/mlir_aie_examples_npu.log`). |
 | DMA | 2 S2MM + 2 MM2S channels; 16 BDs; 16 locks | SPEC: `AIE2TargetModel::getNum{Dest,Source}SwitchboxConnections` (DMA bundle = 2 each way); `getNumBDs` = 16, `getNumLocks` = 16 for non-mem tiles. |
@@ -856,7 +856,8 @@ decomposition per shape, not a generic one.
 - int8×int4, int16×int4 and bfp16 MACs — tabulated for AIE2p only (SPEC 1.2), and
   untested here. **int16×int16 no longer belongs on this list**: it is absent from
   `device.yaml`'s AIE2 block but present in the silicon, issued as a single native `vmac`
-  at shape `4x4x4` (MEASURED by disassembly, `results/aie/int16_matmul_sweep_npu.log`).
+  with no emulation sequence (MEASURED by disassembly); its `4x4x4` width is DERIVED from
+  the mmul shape (`results/aie/int16_matmul_sweep_npu.log`).
 - A vector fp32 multiply path — not in the table; fp32 products cost two bf16 MACs, fp32
   accumulation is free.
 - More than 64 KB per core, 512 KB per mem tile, 16 BDs and 16 locks per core or shim tile,

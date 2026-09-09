@@ -28,6 +28,15 @@ Read these before quoting anything below.
   single-buffering the final output FIFO. See `bottleneck_widthfix_npu.log`,
   `conv2dk3_widthfix_npu.log` and `bottleneck_w56_npu.log`. The op-class verdict is
   unaffected; reaching 56×56 made it worse, not better (CPU wins 12.75×).
+- **`int16_matmul_sweep_npu.log`'s "AIE2 has no `int16xint16` MAC, so A16W16 is emulation"
+  is RETRACTED in its own `CORRECTION` appendix**, same day, before it was ever cited. That
+  read a missing row in OGOAT's `device.yaml` — a graph-optimizer **cost model**, not an ISA
+  reference — as a statement about the silicon. Peano disassembly of the log's own int16
+  core ELF shows plain `vmac cm, cm, x, x, r`, identical in form to int8's, with no
+  `vshift`/`vadd`/`vsrs` emulation sequence: **int16×int16 is native on AIE2**, and only the
+  MAC *shape* differs (`4x4x4` vs int8's `4x8x8`). No measured number moves — the predicted
+  ratio was 256/64 = 4× either way. `docs/SILICON.md`'s "Absent from the table" rows were
+  re-tagged in the same pass.
 - **`attention_bf16_kernel_npu.log`'s diagnosis is corrected** by `dispatch_floor_npu.log`:
   the loss was blamed on per-dispatch cost, which is ~1% of Stage 2's measured time. The
   real cause is that `attention_kernels.cc` uses `aie::mmul` zero times. The verdict
