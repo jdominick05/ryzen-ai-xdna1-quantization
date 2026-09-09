@@ -525,3 +525,69 @@ AIE Partitions
   No hardware contexts running on device
 
 === end 2026-09-09 16:47:58 ===
+
+================================================================================
+CORRECTION (2026-09-09, same session, before this log was ever cited)
+================================================================================
+The WHY THIS EXISTS section above says "**A16W16 has no native MAC combination on
+AIE2.** Whatever runs is emulation." **That is wrong, and it was over-read from a
+cost-model table.** Retracted here rather than edited above, per this directory's
+convention.
+
+What the source actually supports: OGOAT's `device.yaml` -- a graph-optimizer COST MODEL,
+not an ISA reference -- lists no `int16xint16` row in its AIE2 `macs_per_cycle` block,
+while AIE2p's block has one. docs/SILICON.md states this correctly and carefully, as
+"**Absent from the table**", tagged SPEC. Promoting "absent from a cost-model table" to
+"absent from the silicon", and then to "emulation", is exactly the SPEC-to-fact promotion
+CLAUDE.md's SILICON note forbids. SILICON.md line 764 had already noticed the tension in
+passing: "`mm.cc` ships only int16xint16 4x4x4" -- for **aie2**, not aie2p.
+
+Settled by disassembly, which is cheap and was available all along. The compiled int16
+core ELF from this sitting's own JIT cache (`matmul_i16_i32`, `aie.mlir` carrying 247
+`i16` types), disassembled with Peano's `llvm-objdump -d --triple=aie2`:
+
+  vlda wl5,[p1],#0x100;  vldb wl9,[p6],#0x20;  vups.s64.s32 cm1,x0,s0;  vmac cm4,cm2,x10,x1,r3
+  vldb wl11,[p5],#0x20;                                                 vmac cm3,cm3,x10,x0,r3
+  vmac cm1,cm3,x3,x6,r3
+
+32 `vmac` in the int16 kernel. The int8 kernel (`matmul_i8_i32`, same design, same
+sitting) emits the byte-identical instruction FORM, 24 of them:
+
+  vlda wl3,[p4],#0x20;  vldb wl6,[p0],#0x20;  mov r24,p5;  vmac cm7,cm7,x5,x9,r6
+
+Same mnemonic, same shape: two `x` vector-register operands accumulating into a `cm`
+accumulator, one instruction. Scanning the whole int16 ELF for the ops an emulation would
+need finds **none** -- no `vshift`, no `vadd`, no `vsrs` -- only 3 `vups.s64.s32`, which
+are the K-reduction's accumulator upsizes, not per-product fixups. AIE2's `vmac` is
+polymorphic; the operand and mode registers select the MAC shape.
+
+**So AIE2 does have a native int16xint16 MAC.** What it has instead of a missing
+instruction is a smaller MAC SHAPE: mlir-aie's `aie2/mm.cc` and the compiler's own
+`_MM_MAC_DIMS` give int16 `4x4x4` = **64 MACs per `vmac`**, against int8's `4x8x8` = 256
+and bf16's `4x8x4` = 128. That is DERIVED the same way docs/SILICON.md already derives
+int8's: "one AIE2 int8 `vmac` therefore retires 4*8*8 = 256 MACs, which is exactly the 256
+MACs/cycle nameplate."
+
+This does not move a single measured number, and it does not weaken the finding -- the
+predicted ratio was 256/64 = 4x either way. It makes the result sharper, because the
+utilisation is now computable against a real per-dtype ceiling. At 1024^3, 16 cores,
+1.80 GHz measured core clock (docs/SILICON.md):
+
+  dtype   GOPS      MACs/cycle/core   ceiling (mmul shape)   utilisation
+  ------------------------------------------------------------------------
+  i8      2680.23         46.53       256  (4x8x8)              18.2%
+  i16     1823.75         31.66        64  (4x4x4)              49.5%
+  bf16    1858.23         32.26       128  (4x8x4)              25.2%
+
+int16 runs at HALF its MAC ceiling while int8 runs at under a fifth of its own, and the
+two 2-byte dtypes sit at 31.66 and 32.26 MACs/cycle/core -- within 2% of each other in
+ABSOLUTE terms despite ceilings that differ 2x. That is the quantitative form of the
+"dtype-blind default tile" reading, and it is stronger evidence for it than the GOPS
+table alone: the dtypes do not converge because they share a ceiling, they converge
+because none of them is anywhere near one.
+
+Still TO VERIFY, and not claimed here: the 64-MACs-per-`vmac` figure is DERIVED from the
+mmul shape, not read off an ISA table or counted against a cycle-accurate model -- this
+repo has no AIE2 ISA reference listing per-dtype `vmac` retire widths
+(results/aie/aie2_isa_static.log has no int16 entry). What IS directly observed is that
+one `vmac` issues per mmul with no emulation sequence around it.

@@ -637,15 +637,21 @@ been closed:
   Strix's `AIE2p` block, for contrast, adds `bfp16` and `int16xint16`/`int8xint4`
   combinations AIE2 lacks and roughly doubles most throughput figures — an asymmetry
   that is itself evidence this is a real per-chip table, not a copy-pasted default.
-  **Measured follow-up (2026-09-09):** the missing `int16xint16` entry is not academic —
-  `whole_array.py` still compiles an int16 GEMM for Phoenix, out of a 4×4×4 `aie::mmul`
-  carrying 64 MACs against int8's 4×8×8 and 256. It runs at **0.68–1.04× the int8 rate
+  **Measured follow-up (2026-09-09), which corrects the reading of that gap:** the
+  missing `int16xint16` row is a **cost-model** gap, not a missing instruction.
+  `whole_array.py` compiles an int16 GEMM for Phoenix, and disassembling the resulting
+  core ELF (Peano, `--triple=aie2`) shows plain `vmac cm, cm, x, x, r` — the same
+  instruction form int8 emits — with no `vshift`/`vadd`/`vsrs` emulation sequence
+  anywhere. **int16×int16 is native on AIE2**; what differs is the MAC *shape*, 4×4×4 =
+  64 MACs per `vmac` against int8's 4×8×8 = 256. It runs at **0.68–1.04× the int8 rate
   and within 3% of bf16 at every shape**, i.e. a quarter of the MAC throughput costs
   nothing measurable, because this design's default tile is bound by byte width and A
-  re-streaming rather than by MAC issue rate. It also does not verify at all until the
-  input range is narrowed to fit the int32 accumulator (~9.5–11 usable value bits at
-  K = 512…4096), which is the concrete sense in which "high-dynamic-range INT16" is not
-  available on this path. `results/aie/int16_matmul_sweep_npu.log`.
+  re-streaming rather than by MAC issue rate — at 1024³ int8 sits at 18.2% of its own
+  ceiling, bf16 25.2%, int16 49.5%, with the two 2-byte dtypes within 2% of each other in
+  absolute MACs/cycle/core. It also does not verify at all until the input range is
+  narrowed to fit the int32 accumulator (~9.5–11 usable value bits at K = 512…4096),
+  which is the concrete sense in which "high-dynamic-range INT16" is not available on
+  this path. `results/aie/int16_matmul_sweep_npu.log`.
   **Checked whether an actual custom kernel could be built and run on Phoenix from
   material already in this install — a real dead end, confirmed rather than assumed.**
   The same `waic` wheel also bundles `aie4_models/`, a large internal AMD kernel-source

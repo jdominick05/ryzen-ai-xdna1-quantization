@@ -1378,12 +1378,24 @@ Two facts had to come first, and the first one narrows the question.
 
 AMD's own `device.yaml`, read verbatim into `results/aie/notes_aie2_device_dtypes.log`,
 gives the AIE2 block mixed into `phoenix:` — this chip — `macs_per_cycle` for exactly
-three combinations: `bfloat16xbfloat16` 128, `int16xint8` 128, `int8xint8` 256. There is
-**no `int16xint16` entry at all**; AIE2p (Strix) has one, at 128. So on this silicon
-**A16W8 is the natively-specified 16-bit path, at half int8's MAC rate** (SPEC, not
-measured here — `whole_array.py` takes one `--dtype_in` for both operands, so a mixed
-int16×int8 GEMM is not expressible in that design and was not run), and **A16W16 has no
-native MAC combination**: whatever runs is emulation.
+three combinations: `bfloat16xbfloat16` 128, `int16xint8` 128, `int8xint8` 256, with **no
+`int16xint16` row**; AIE2p (Strix) has one. So **A16W8 is the natively-*tabulated* 16-bit
+path, at half int8's MAC rate** (SPEC, not measured here — `whole_array.py` takes one
+`--dtype_in` for both operands, so a mixed int16×int8 GEMM is not expressible in that
+design and was not run).
+
+**That missing row is a cost-model gap, not a missing instruction** — a distinction this
+section got wrong on first writing and corrected the same day (see the log's `CORRECTION`
+appendix). `device.yaml` is OGOAT's graph-optimizer cost model, not an ISA reference, and
+`docs/SILICON.md` records the absence carefully as "Absent from the table", tagged SPEC.
+Disassembling this sitting's own int16 core ELF with Peano (`llvm-objdump -d
+--triple=aie2`) settles it: the int16 kernel issues plain `vmac cm, cm, x, x, r`
+instructions — the byte-identical *form* int8 emits — with **no `vshift`, `vadd` or
+`vsrs` anywhere**, i.e. no emulation sequence. AIE2's `vmac` is polymorphic and the mode
+operand selects the MAC shape. **int16×int16 is native on AIE2**; what differs is the
+shape, `4x4x4` = 64 MACs per `vmac` (mlir-aie's `aie2/mm.cc` and the compiler's
+`_MM_MAC_DIMS`) against int8's `4x8x8` = 256 and bf16's `4x8x4` = 128 — DERIVED the same
+way `docs/SILICON.md` already derives int8's 256.
 
 The second fact is that the emulated path does not verify out of the box. `--dtype_in
 i16 --dtype_out i32` FAILs at all ten shapes, with numpy's own reference raising
@@ -1430,6 +1442,20 @@ where m is large. That is byte width behaving like the independent variable and 
 shape behaving like noise — a third dtype agreeing with the "dtype-blind default tile"
 reading the int8 section above arrived at, and the sharpest of the three, because int16
 differs from bf16 in MAC shape while matching it in bytes.
+
+**Against each dtype's own MAC ceiling, none of them is close** — which is why they
+converge. At 1024³, 16 cores, the measured 1.80 GHz core clock:
+
+| dtype | GOPS | MACs/cycle/core | ceiling (mmul shape) | utilisation |
+|---|---|---|---|---|
+| i8 | 2680.23 | 46.53 | 256 (`4x8x8`) | 18.2% |
+| i16 | 1823.75 | 31.66 | 64 (`4x4x4`) | 49.5% |
+| bf16 | 1858.23 | 32.26 | 128 (`4x8x4`) | 25.2% |
+
+int16 runs at half its ceiling where int8 runs at under a fifth of its own, and the two
+2-byte dtypes sit at 31.66 and 32.26 MACs/cycle/core — within 2% **in absolute terms**,
+across ceilings that differ by 2×. The dtypes do not converge because they share a
+ceiling; they converge because none of them is near one.
 
 **What this does not establish.** Not A16W8 — the natively-specified path was not
 measured, and `results/a16w8/` documents the separate EP-level reason it does not reach

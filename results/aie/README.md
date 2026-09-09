@@ -652,11 +652,17 @@ each config recompiles (seconds). CPU timings were taken beside another session'
 evaluation runs. Cited by [`kernels/README.md`](../../kernels/README.md).
 
 **`int16_matmul_sweep_npu.log`** — the 16-bit GEMM throughput the backlog had asked for,
-and the finding that the question was half mis-posed. AMD's own `device.yaml`
-(`notes_aie2_device_dtypes.log`) gives AIE2 **no `int16xint16` MAC at all** — the 16-bit
-combination this silicon specifies is `int16xint8` at 128 macs/cycle, half `int8xint8`'s
-256 — so A16W16 on Phoenix is emulation, and A16W8 (the native one) is not expressible in
-`whole_array.py`, which takes a single `--dtype_in`. The emulated path also FAILs
+and the finding that the question was half mis-posed. **Carries its own `CORRECTION`
+appendix**, and the correction is the more interesting half: the log first read
+`device.yaml`'s missing `int16xint16` row as "no native MAC, whatever runs is emulation",
+which promotes a **cost-model** table gap to an ISA fact — the SPEC-to-fact promotion
+`docs/SILICON.md` explicitly guards against, and which that file gets right as "Absent
+from the table". Disassembly settles it: the int16 core ELF issues plain
+`vmac cm, cm, x, x, r`, byte-identical in form to int8's, with no `vshift`/`vadd`/`vsrs`
+emulation sequence. **int16×int16 is native on AIE2**; the difference is MAC *shape*,
+`4x4x4` = 64 MACs per `vmac` vs int8's `4x8x8` = 256 and bf16's `4x8x4` = 128. A16W8
+remains untested — it is not expressible in `whole_array.py`, which takes a single
+`--dtype_in`. The int16 path also FAILs
 verification at every shape out of the box: inputs at ±(max//4) = ±8192 against a
 `dtype_out`-typed K-reduction overflow int32 from K ≥ 32.
 `kernels/int8_matmul_sweep/whole_array_int_input_bound.patch` narrows the input range to
