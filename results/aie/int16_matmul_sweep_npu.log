@@ -591,3 +591,34 @@ mmul shape, not read off an ISA table or counted against a cycle-accurate model 
 repo has no AIE2 ISA reference listing per-dtype `vmac` retire widths
 (results/aie/aie2_isa_static.log has no int16 entry). What IS directly observed is that
 one `vmac` issues per mmul with no emulation sequence around it.
+
+================================================================================
+CONTENTION DISCLOSURE (added same session, after the fact)
+================================================================================
+A peer process was live on this host for the whole sitting and is disclosed here rather
+than left for a reader to find. `Get-CimInstance Win32_Process` identifies it as
+`C:\Users\<user>\miniforge3\python.exe -` (PID 22396, a bare interpreter reading a script
+from stdin, i.e. another session's tool call, not one of this repo's pipelines). It
+started 15:15 and had accumulated 6,701 CPU-seconds when checked at ~16:55 -- roughly 1.15
+cores of a 16-thread 8700G, sustained, across this sitting's 16:46-16:52.
+
+Why the numbers are still reported, and what carries a caveat:
+
+- **The NPU was uncontended.** `xrt-smi examine -r aie-partitions` read "No hardware
+  contexts running on device" immediately before and immediately after the sitting (both
+  captures are in the raw output above), and the peer never opened one.
+- **The comparison is internally controlled.** i8, i16 and bf16 ran back-to-back in the
+  same sitting under the same peer load, so any host-side drag applies to all three
+  columns. The i16/i8 and i16/bf16 ratios -- which are the finding -- are not exposed to it.
+- **The absolute GOPS are corroborated anyway.** The i8 rows reproduce the 2026-09-07
+  sweep within +0.2% to +4.2%, mostly slightly FASTER, which is direct evidence the peer
+  load did not depress this sitting. See CONTROL above.
+- **What is exposed:** the `e2e avg us` column, which brackets the Python call and so
+  includes host time. Nothing in this log's conclusions rests on it; the GOPS come from
+  the NPU-time bracket around `kernel.wait()`.
+
+This is the same disclosure `int8_matmul_sweep_npu.log` makes for its own sitting, and it
+is made here for the same reason: a peer session's CPU load has already contaminated one
+number in this repo (the webcam fps in
+`results/webcam_single_4x4_yolov8n_cut_xint8_adaround_npu.log`), and the fix is to say so
+in the log rather than to discover it later.
