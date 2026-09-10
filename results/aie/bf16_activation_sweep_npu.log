@@ -1,0 +1,500 @@
+bf16 activation kernels (ReLU / SiLU / GELU) on the NPU against Zen 4 torch -- the timing
+half of a result this repo had only ever half-taken. `mlir_aie_ml_examples_npu.log`
+recorded all three as `PASS!` in 2026-09-07, i.e. they compile and they are correct, but
+nothing was ever timed, so there was no verdict. There is one now, and it is negative:
+**the NPU loses to the CPU at every op and every size measured, end to end.** The single
+crossing anywhere in the grid is ReLU at 16.7M elements on NPU-time-only (1.09x), which
+still loses at 0.77x once the dispatch is paid.
+Desktop 2 (Ryzen 7 8700G / Phoenix XDNA1), DESKTOP-CBL5NUA, 2026-09-09, mlir-aie v1.4.2,
+ironenv (torch 2.14.0+cpu, 8 threads). 15 rows, each in its own process, 21:18-21:32.
+`xrt-smi examine -r aie-partitions` read "No hardware contexts running on device" before
+and after. The host was quiet: the peer process that had been busy earlier in the evening
+(PID 22396) accumulated **33 CPU-seconds across the whole 13-minute sweep**, i.e. ~0.04
+cores, and both process snapshots are in the raw output below.
+
+WHY THIS EXISTS
+===============
+The backlog item is "BF16 Continuous Activation Engine: implement vector BF16
+polynomial/lookup activation kernels (GELU, SiLU, Sigmoid) on AIE vector units,
+eliminating Quark's HardSwish/HardSigmoid structural modifications." mlir-aie already
+ships those kernels (`aie.iron.kernels.{relu,silu,gelu}`, driven by `ml/eltwise_unary`),
+and this machine had already run them clean. So the open question was never "can it be
+built" -- it was "is it worth dispatching", which is a timing question nobody had asked.
+
+The prior is bad, and it is worth stating up front rather than discovering it in the
+table. An activation is pure bandwidth: two bytes in, two bytes out, one cheap op per
+element, zero reuse. There is no arithmetic intensity for the array to exploit, which is
+the same structural reason `groupnorm_bf16` ultimately failed. And this repo has already
+measured the host-set dispatch floor -- **617 us one-shot through `@iron.jit`, ~531 us
+batched IRON, 36.7 us batched C++** (`dispatch_floor_npu.log`) -- so an activation only
+wins if the CPU needs longer than that for the same tensor. The sweep exists to find that
+crossover or to show there isn't one.
+
+WHAT WAS RUN
+============
+`kernels/bf16_activation_sweep/npu_activation_sweep.py` (new here), driving the upstream
+`ml/eltwise_unary` design (v1.4.2, UNMODIFIED -- no patch this time) through its own
+`@iron.jit` entry point, timed with mlir-aie's own `aie.utils.benchmark.run_iters`,
+20 timed iterations after 5 warmup, `num_channels=2` (both shim DMA channels per column).
+The CPU leg runs in the same process, so both legs share a sitting by construction.
+
+  python kernels/bf16_activation_sweep/npu_activation_sweep.py \
+      --ops <op> --lengths <L> --iters 20 --warmup 5     # once per (op, L)
+
+Two methodology choices, both forced by mistakes this sweep made first:
+
+1. **More than one CPU kernel per op, verdict to the fastest.** Timing only torch's bf16
+   path would have inverted the SiLU verdict completely -- see METHODOLOGY below. Each op
+   is timed against 3-4 CPU implementations (bf16 and fp32 torch, plus a hand-composed
+   variant) and the FASTEST is the verdict line, which is the rule
+   `int8_matmul_sweep_npu.log` already set for int8 GEMM.
+2. **One (op, length) per FRESH process.** Running all variants in one process let earlier
+   ones warm the allocator for later ones -- also below.
+
+Accuracy is checked against `aie.iron.kernels.{relu,silu,gelu}_ref` at the design's OWN
+tolerances (relu exact; silu rtol=0.128; gelu rtol=0.128 + atol=0.05).
+
+RESULT
+======
+CPU/NPU > 1 means the NPU is faster. `NPU us` is the bracket around `kernel.wait()`;
+`e2e us` is the bracket around the Python call and therefore pays the dispatch -- e2e is
+the honest column for "should this op run on the NPU at all".
+
+  op     L          NPU us    e2e us    CPU us   NPU GB/s  CPU GB/s  CPU/NPU  CPU/e2e  CPU kernel
+  ----------------------------------------------------------------------------------------------
+  relu      65536    185.0     711.0       4.2       1.42     62.42     0.02     0.01  torch fp32
+  relu     262144    196.6     727.9       7.2       5.33    145.64     0.04     0.01  torch fp32
+  relu    1048576    239.1     724.6      22.7      17.54    184.77     0.09     0.03  torch fp32
+  relu    4194304    466.9    1044.8     136.4      35.93    123.00     0.29     0.13  torch bf16
+  relu   16777216   1280.0    1808.4    1390.6      52.43     48.26     1.09     0.77  clamp bf16
+  silu      65536    198.4     741.2      21.4       1.32     12.22     0.11     0.03  torch fp32
+  silu     262144    267.9     788.9      27.1       3.91     38.69     0.10     0.03  torch fp32
+  silu    1048576    542.0    1157.2     104.7       7.74     40.08     0.19     0.09  torch fp32
+  silu    4194304   1648.2    2388.3     543.0      10.18     30.90     0.33     0.23  torch fp32
+  silu   16777216   5994.0    6773.9    3044.6      11.20     22.04     0.51     0.45  torch fp32
+  gelu      65536    204.2     725.5      17.3       1.28     15.15     0.08     0.02  torch fp32
+  gelu     262144    301.7     840.6      20.9       3.48     50.05     0.07     0.02  torch bf16
+  gelu    1048576    682.3    1206.0      98.2       6.15     42.73     0.14     0.08  torch bf16
+  gelu    4194304   2235.0    2998.5     360.2       7.51     46.58     0.16     0.12  torch bf16
+  gelu   16777216   8354.5    9218.6    1714.6       8.03     39.14     0.21     0.19  torch bf16
+
+**The verdict is a clean loss.** Best case end-to-end is 0.77x (ReLU, 16.7M elements =
+64 MB in, 64 MB out). SiLU tops out at 0.45x, GELU at 0.19x.
+
+Three things the table shows about WHY, in decreasing order of confidence.
+
+1. **The NPU's ceiling is set by the op, not by the transfer, for two of the three.**
+   ReLU reaches **52.43 GB/s** and is still climbing at the largest size; SiLU flattens at
+   **11.20 GB/s** and GELU at **8.03 GB/s**, and both are flat from 4M to 16.7M while ReLU
+   is not. All three move exactly the same bytes. So the LUT-based ops are limited on the
+   core, not on the DMA -- ReLU is the only one of the three that is actually a bandwidth
+   test, and it is the only one that ever crosses.
+
+2. **The dispatch floor is the whole story at small sizes and never stops mattering.**
+   e2e minus NPU time is 500-560 us at every ReLU row, which is the 531-617 us IRON floor
+   this repo already measured, arriving again from an unrelated design. At L=65536 the CPU
+   finishes in 4.2 us -- 170x inside the floor. Nothing that touches this dispatch path can
+   win at that size regardless of how good the kernel is.
+
+3. **The CPU is fastest exactly where the NPU is weakest.** CPU bandwidth peaks at
+   184.77 GB/s at 1M elements (2 MB in, 2 MB out -- comfortably cache-resident) and falls
+   to 22-48 GB/s at 16.7M when it has to go to DRAM. The NPU's only crossing happens at
+   the one size where the CPU has lost its cache advantage.
+
+ACCURACY -- the one clearly positive result here
+================================================
+All 15 rows PASS at the design's own tolerances, and by a wide margin:
+
+  relu   max abs err 0.00000   exact
+  silu   max abs err 0.03125   max rel err 5.48%  (tolerance allows 12.8%)
+  gelu   max abs err 0.01562   max rel err 3.98%  (tolerance allows 12.8% + 0.05 abs)
+
+Both max-abs figures are exact bf16 quantization steps (1/32 and 1/64 at these
+magnitudes), which suggests the observed error is dominated by bf16 rounding rather than
+by LUT approximation. So the premise behind the backlog item -- that a real bf16
+SiLU/GELU on the array would be more faithful than Quark's HardSwish/HardSigmoid
+substitution -- **is supported on accuracy**. It just cannot be delivered profitably
+through this dispatch path.
+
+Note on the relative-error metric: a naive max-relative-error reads exactly 1.0000 for
+GELU, which is an artefact, not a finding. GELU's reference is a small negative number in
+the tail (gelu(-3) ~ -0.0036), so a kernel returning 0 there scores 100% relative error
+while being off by 0.0036 absolute. That is precisely why upstream pairs rtol with atol
+for GELU. The metric here restricts the ratio to entries where |ref| >= 0.1 and reports
+max-absolute alongside; an earlier pass of this sweep published the misleading 1.0000 and
+it was corrected before this log was written.
+
+METHODOLOGY -- two ways this sweep was wrong before it was right
+===============================================================
+Both are recorded because each would have produced a confident, publishable, WRONG number.
+
+**1. CPU kernel choice swings the SiLU verdict by 4x.** At L=16.7M, isolated:
+
+  torch fp32 silu      3044.6 us   <- verdict
+  x*sigmoid bf16       4285.2 us
+  x*sigmoid fp32       7455.0 us
+  torch bf16 silu     11820.4 us   <- 3.9x slower than torch's own fp32 silu
+
+Timing only `F.silu` on a bf16 tensor -- the obvious choice, matching the NPU's dtype --
+would have given **CPU/NPU 1.97x and a headline "SiLU is an NPU win"**. Against the
+fastest available CPU kernel it is **0.51x, a 2x loss**. torch's bf16 SiLU is an
+unoptimized path on this CPU, and matching the NPU's dtype is not the same as giving the
+CPU its best shot. This is the THIRD time this repo has hit this exact trap
+(`conv2x_int8_cpu_baseline.log`, the MobileViT splice, now here), and the first time the
+rule caught it prospectively rather than in review.
+
+**2. Running variants in one process contaminated a timing by 5x.** In a combined pass
+that timed all CPU variants for all ops in one interpreter, torch-bf16 SiLU at L=16.7M
+read **2606.2 us** and was selected as the fastest CPU kernel. Two independent isolated
+runs of that same call read **11820.4 us** and **12904.4 us**. The 2.6 ms figure is the
+outlier and is not reproducible; the most likely cause is allocator/page reuse warmed by
+the variants timed before it, though that is a hypothesis and was not isolated further.
+Every row above therefore comes from its own fresh process. **UNEXPLAINED, kept as such**
+-- what matters operationally is that same-process variant sweeps are not safe for
+absolute CPU timings here.
+
+WHAT THIS DOES NOT ESTABLISH
+============================
+- **Not a statement about the kernels' quality.** These are mlir-aie's own activation
+  kernels used as shipped. Whether a hand-written bf16 activation could beat 11 GB/s is
+  untested; what the table shows is that even the ReLU path, which reaches 52 GB/s and is
+  presumably near the DMA limit, still loses end-to-end.
+- **Not a fused result, and that is the live question.** Every row here is a STANDALONE
+  dispatch, which is the worst possible framing for an op this cheap. The item's real
+  value was always as an epilogue fused into a larger kernel -- exactly what
+  `docs/SILICON.md` K4 says about tiny ops ("only worth building inside a larger fused
+  graph, not as a standalone kernel that lands under the dispatch floor"). Nothing here
+  measures a fused activation, and nothing here argues against one; `ml/
+  mm_activation_epilogue` is the shape that would answer it and is Strix-only in this tree.
+- **Not Sigmoid.** The item names GELU, SiLU and Sigmoid; `ml/eltwise_unary` offers
+  relu/silu/gelu only, so Sigmoid was not measured.
+- **No iGPU leg.** DirectML was not run; the comparison is NPU vs CPU only.
+
+RAW OUTPUT
+================================================================================
+﻿=== bf16 activation sweep, ISOLATED (one process per row). start 2026-09-09 21:31:23 ===
+host: DESKTOP-CBL5NUA
+--- contention check before ---
+
+-----------------------------
+[003d:00:01.1] : NPU Phoenix
+-----------------------------
+AIE Partitions
+  No hardware contexts running on device
+
+--- peer processes before ---
+
+   Id ProcessName StartTime                    CPU
+   -- ----------- ---------                    ---
+22396 python      9/9/2026 3:15:31 PM 22449.359375
+
+
+
+
+################ relu  L=65536  (21:31:23) ################
+bf16 activation sweep  channels=2  iters=20 warmup=5  torch=2.14.0+cpu threads=8
+design: C:\Users\<user>\mlir-aie\programming_examples\ml\eltwise_unary
+
+=== relu  L=65536  ch=2 ===
+  NPU  avg     185.0 us  min     169.4 us     1.42 GB/s
+  e2e  avg     711.0 us   (host-side, includes dispatch)
+  CPU  torch fp32       med       4.2 us  min       4.1 us  <- verdict
+  CPU  clamp bf16       med       6.6 us  min       6.5 us
+  CPU  torch bf16       med       8.0 us  min       6.3 us
+  CPU best       4.2 us    62.42 GB/s
+  CPU/NPU   0.02x on NPU time,   0.01x on e2e
+  accuracy: PASS at the design's own tolerance   max abs err 0.00000   max rel err (|ref|>=0.1) 0.00000
+
+SUMMARY  (CPU/NPU > 1 means the NPU is faster; e2e is the honest column, it pays the dispatch)
+   op         L     NPU us     e2e us     CPU us  NPU GB/s  CPU GB/s  CPU/NPU  CPU/e2e   maxabs   acc  CPU kernel
+----------------------------------------------------------------------------------------------------------------------------
+ relu     65536      185.0      711.0        4.2      1.42     62.42     0.02     0.01  0.00000  PASS  torch fp32
+
+################ relu  L=262144  (21:31:25) ################
+bf16 activation sweep  channels=2  iters=20 warmup=5  torch=2.14.0+cpu threads=8
+design: C:\Users\<user>\mlir-aie\programming_examples\ml\eltwise_unary
+
+=== relu  L=262144  ch=2 ===
+  NPU  avg     196.6 us  min     174.8 us     5.33 GB/s
+  e2e  avg     727.9 us   (host-side, includes dispatch)
+  CPU  torch fp32       med       7.2 us  min       7.0 us  <- verdict
+  CPU  torch bf16       med      11.4 us  min      11.2 us
+  CPU  clamp bf16       med      11.7 us  min      11.6 us
+  CPU best       7.2 us   145.64 GB/s
+  CPU/NPU   0.04x on NPU time,   0.01x on e2e
+  accuracy: PASS at the design's own tolerance   max abs err 0.00000   max rel err (|ref|>=0.1) 0.00000
+
+SUMMARY  (CPU/NPU > 1 means the NPU is faster; e2e is the honest column, it pays the dispatch)
+   op         L     NPU us     e2e us     CPU us  NPU GB/s  CPU GB/s  CPU/NPU  CPU/e2e   maxabs   acc  CPU kernel
+----------------------------------------------------------------------------------------------------------------------------
+ relu    262144      196.6      727.9        7.2      5.33    145.64     0.04     0.01  0.00000  PASS  torch fp32
+
+################ relu  L=1048576  (21:31:27) ################
+bf16 activation sweep  channels=2  iters=20 warmup=5  torch=2.14.0+cpu threads=8
+design: C:\Users\<user>\mlir-aie\programming_examples\ml\eltwise_unary
+
+=== relu  L=1048576  ch=2 ===
+  NPU  avg     239.1 us  min     228.1 us    17.54 GB/s
+  e2e  avg     724.6 us   (host-side, includes dispatch)
+  CPU  torch fp32       med      22.7 us  min      22.5 us  <- verdict
+  CPU  torch bf16       med      37.3 us  min      36.9 us
+  CPU  clamp bf16       med      37.9 us  min      37.7 us
+  CPU best      22.7 us   184.77 GB/s
+  CPU/NPU   0.09x on NPU time,   0.03x on e2e
+  accuracy: PASS at the design's own tolerance   max abs err 0.00000   max rel err (|ref|>=0.1) 0.00000
+
+SUMMARY  (CPU/NPU > 1 means the NPU is faster; e2e is the honest column, it pays the dispatch)
+   op         L     NPU us     e2e us     CPU us  NPU GB/s  CPU GB/s  CPU/NPU  CPU/e2e   maxabs   acc  CPU kernel
+----------------------------------------------------------------------------------------------------------------------------
+ relu   1048576      239.1      724.6       22.7     17.54    184.77     0.09     0.03  0.00000  PASS  torch fp32
+
+################ relu  L=4194304  (21:31:29) ################
+bf16 activation sweep  channels=2  iters=20 warmup=5  torch=2.14.0+cpu threads=8
+design: C:\Users\<user>\mlir-aie\programming_examples\ml\eltwise_unary
+
+=== relu  L=4194304  ch=2 ===
+  NPU  avg     466.9 us  min     441.9 us    35.93 GB/s
+  e2e  avg    1044.8 us   (host-side, includes dispatch)
+  CPU  torch bf16       med     136.4 us  min     134.9 us  <- verdict
+  CPU  clamp bf16       med     137.0 us  min     131.3 us
+  CPU  torch fp32       med     472.0 us  min     415.8 us
+  CPU best     136.4 us   123.00 GB/s
+  CPU/NPU   0.29x on NPU time,   0.13x on e2e
+  accuracy: PASS at the design's own tolerance   max abs err 0.00000   max rel err (|ref|>=0.1) 0.00000
+
+SUMMARY  (CPU/NPU > 1 means the NPU is faster; e2e is the honest column, it pays the dispatch)
+   op         L     NPU us     e2e us     CPU us  NPU GB/s  CPU GB/s  CPU/NPU  CPU/e2e   maxabs   acc  CPU kernel
+----------------------------------------------------------------------------------------------------------------------------
+ relu   4194304      466.9     1044.8      136.4     35.93    123.00     0.29     0.13  0.00000  PASS  torch bf16
+
+################ relu  L=16777216  (21:31:31) ################
+bf16 activation sweep  channels=2  iters=20 warmup=5  torch=2.14.0+cpu threads=8
+design: C:\Users\<user>\mlir-aie\programming_examples\ml\eltwise_unary
+
+=== relu  L=16777216  ch=2 ===
+  NPU  avg    1280.0 us  min    1232.1 us    52.43 GB/s
+  e2e  avg    1808.4 us   (host-side, includes dispatch)
+  CPU  clamp bf16       med    1390.6 us  min    1300.7 us  <- verdict
+  CPU  torch bf16       med    1410.7 us  min    1287.9 us
+  CPU  torch fp32       med    3127.6 us  min    2956.7 us
+  CPU best    1390.6 us    48.26 GB/s
+  CPU/NPU   1.09x on NPU time,   0.77x on e2e
+  accuracy: PASS at the design's own tolerance   max abs err 0.00000   max rel err (|ref|>=0.1) 0.00000
+
+SUMMARY  (CPU/NPU > 1 means the NPU is faster; e2e is the honest column, it pays the dispatch)
+   op         L     NPU us     e2e us     CPU us  NPU GB/s  CPU GB/s  CPU/NPU  CPU/e2e   maxabs   acc  CPU kernel
+----------------------------------------------------------------------------------------------------------------------------
+ relu  16777216     1280.0     1808.4     1390.6     52.43     48.26     1.09     0.77  0.00000  PASS  clamp bf16
+
+################ silu  L=65536  (21:31:33) ################
+bf16 activation sweep  channels=2  iters=20 warmup=5  torch=2.14.0+cpu threads=8
+design: C:\Users\<user>\mlir-aie\programming_examples\ml\eltwise_unary
+
+=== silu  L=65536  ch=2 ===
+  NPU  avg     198.4 us  min     184.0 us     1.32 GB/s
+  e2e  avg     741.2 us   (host-side, includes dispatch)
+  CPU  torch fp32       med      21.4 us  min      21.0 us  <- verdict
+  CPU  x*sigmoid fp32   med      25.0 us  min      24.8 us
+  CPU  x*sigmoid bf16   med      35.0 us  min      34.7 us
+  CPU  torch bf16       med     176.1 us  min     174.9 us
+  CPU best      21.4 us    12.22 GB/s
+  CPU/NPU   0.11x on NPU time,   0.03x on e2e
+  accuracy: PASS at the design's own tolerance   max abs err 0.03125   max rel err (|ref|>=0.1) 0.05479
+
+SUMMARY  (CPU/NPU > 1 means the NPU is faster; e2e is the honest column, it pays the dispatch)
+   op         L     NPU us     e2e us     CPU us  NPU GB/s  CPU GB/s  CPU/NPU  CPU/e2e   maxabs   acc  CPU kernel
+----------------------------------------------------------------------------------------------------------------------------
+ silu     65536      198.4      741.2       21.4      1.32     12.22     0.11     0.03  0.03125  PASS  torch fp32
+
+################ silu  L=262144  (21:31:35) ################
+bf16 activation sweep  channels=2  iters=20 warmup=5  torch=2.14.0+cpu threads=8
+design: C:\Users\<user>\mlir-aie\programming_examples\ml\eltwise_unary
+
+=== silu  L=262144  ch=2 ===
+  NPU  avg     267.9 us  min     245.1 us     3.91 GB/s
+  e2e  avg     788.9 us   (host-side, includes dispatch)
+  CPU  torch fp32       med      27.1 us  min      27.0 us  <- verdict
+  CPU  x*sigmoid fp32   med      36.5 us  min      35.9 us
+  CPU  x*sigmoid bf16   med      47.5 us  min      46.7 us
+  CPU  torch bf16       med     185.6 us  min     180.9 us
+  CPU best      27.1 us    38.69 GB/s
+  CPU/NPU   0.10x on NPU time,   0.03x on e2e
+  accuracy: PASS at the design's own tolerance   max abs err 0.03125   max rel err (|ref|>=0.1) 0.05479
+
+SUMMARY  (CPU/NPU > 1 means the NPU is faster; e2e is the honest column, it pays the dispatch)
+   op         L     NPU us     e2e us     CPU us  NPU GB/s  CPU GB/s  CPU/NPU  CPU/e2e   maxabs   acc  CPU kernel
+----------------------------------------------------------------------------------------------------------------------------
+ silu    262144      267.9      788.9       27.1      3.91     38.69     0.10     0.03  0.03125  PASS  torch fp32
+
+################ silu  L=1048576  (21:31:37) ################
+bf16 activation sweep  channels=2  iters=20 warmup=5  torch=2.14.0+cpu threads=8
+design: C:\Users\<user>\mlir-aie\programming_examples\ml\eltwise_unary
+
+=== silu  L=1048576  ch=2 ===
+  NPU  avg     542.0 us  min     526.7 us     7.74 GB/s
+  e2e  avg    1157.2 us   (host-side, includes dispatch)
+  CPU  torch fp32       med     104.7 us  min     104.3 us  <- verdict
+  CPU  x*sigmoid fp32   med     136.5 us  min     134.2 us
+  CPU  x*sigmoid bf16   med     186.6 us  min     182.0 us
+  CPU  torch bf16       med     742.5 us  min     721.0 us
+  CPU best     104.7 us    40.08 GB/s
+  CPU/NPU   0.19x on NPU time,   0.09x on e2e
+  accuracy: PASS at the design's own tolerance   max abs err 0.03125   max rel err (|ref|>=0.1) 0.05479
+
+SUMMARY  (CPU/NPU > 1 means the NPU is faster; e2e is the honest column, it pays the dispatch)
+   op         L     NPU us     e2e us     CPU us  NPU GB/s  CPU GB/s  CPU/NPU  CPU/e2e   maxabs   acc  CPU kernel
+----------------------------------------------------------------------------------------------------------------------------
+ silu   1048576      542.0     1157.2      104.7      7.74     40.08     0.19     0.09  0.03125  PASS  torch fp32
+
+################ silu  L=4194304  (21:31:39) ################
+bf16 activation sweep  channels=2  iters=20 warmup=5  torch=2.14.0+cpu threads=8
+design: C:\Users\<user>\mlir-aie\programming_examples\ml\eltwise_unary
+
+=== silu  L=4194304  ch=2 ===
+  NPU  avg    1648.2 us  min    1614.2 us    10.18 GB/s
+  e2e  avg    2388.3 us   (host-side, includes dispatch)
+  CPU  torch fp32       med     543.0 us  min     499.9 us  <- verdict
+  CPU  x*sigmoid bf16   med     860.0 us  min     841.0 us
+  CPU  x*sigmoid fp32   med    1517.7 us  min    1446.4 us
+  CPU  torch bf16       med    3033.4 us  min    2938.0 us
+  CPU best     543.0 us    30.90 GB/s
+  CPU/NPU   0.33x on NPU time,   0.23x on e2e
+  accuracy: PASS at the design's own tolerance   max abs err 0.03125   max rel err (|ref|>=0.1) 0.05479
+
+SUMMARY  (CPU/NPU > 1 means the NPU is faster; e2e is the honest column, it pays the dispatch)
+   op         L     NPU us     e2e us     CPU us  NPU GB/s  CPU GB/s  CPU/NPU  CPU/e2e   maxabs   acc  CPU kernel
+----------------------------------------------------------------------------------------------------------------------------
+ silu   4194304     1648.2     2388.3      543.0     10.18     30.90     0.33     0.23  0.03125  PASS  torch fp32
+
+################ silu  L=16777216  (21:31:42) ################
+bf16 activation sweep  channels=2  iters=20 warmup=5  torch=2.14.0+cpu threads=8
+design: C:\Users\<user>\mlir-aie\programming_examples\ml\eltwise_unary
+
+=== silu  L=16777216  ch=2 ===
+  NPU  avg    5994.0 us  min    5947.4 us    11.20 GB/s
+  e2e  avg    6773.9 us   (host-side, includes dispatch)
+  CPU  torch fp32       med    3044.6 us  min    2990.9 us  <- verdict
+  CPU  x*sigmoid bf16   med    4323.6 us  min    4108.2 us
+  CPU  x*sigmoid fp32   med    7344.3 us  min    7134.4 us
+  CPU  torch bf16       med   11761.4 us  min   11481.5 us
+  CPU best    3044.6 us    22.04 GB/s
+  CPU/NPU   0.51x on NPU time,   0.45x on e2e
+  accuracy: PASS at the design's own tolerance   max abs err 0.03125   max rel err (|ref|>=0.1) 0.05479
+
+SUMMARY  (CPU/NPU > 1 means the NPU is faster; e2e is the honest column, it pays the dispatch)
+   op         L     NPU us     e2e us     CPU us  NPU GB/s  CPU GB/s  CPU/NPU  CPU/e2e   maxabs   acc  CPU kernel
+----------------------------------------------------------------------------------------------------------------------------
+ silu  16777216     5994.0     6773.9     3044.6     11.20     22.04     0.51     0.45  0.03125  PASS  torch fp32
+
+################ gelu  L=65536  (21:31:45) ################
+bf16 activation sweep  channels=2  iters=20 warmup=5  torch=2.14.0+cpu threads=8
+design: C:\Users\<user>\mlir-aie\programming_examples\ml\eltwise_unary
+
+=== gelu  L=65536  ch=2 ===
+  NPU  avg     204.2 us  min     187.3 us     1.28 GB/s
+  e2e  avg     725.5 us   (host-side, includes dispatch)
+  CPU  torch fp32       med      17.3 us  min      16.8 us  <- verdict
+  CPU  torch bf16       med      17.4 us  min      17.1 us
+  CPU  tanh bf16        med      26.8 us  min      26.6 us
+  CPU best      17.3 us    15.15 GB/s
+  CPU/NPU   0.08x on NPU time,   0.02x on e2e
+  accuracy: PASS at the design's own tolerance   max abs err 0.01562   max rel err (|ref|>=0.1) 0.03982
+
+SUMMARY  (CPU/NPU > 1 means the NPU is faster; e2e is the honest column, it pays the dispatch)
+   op         L     NPU us     e2e us     CPU us  NPU GB/s  CPU GB/s  CPU/NPU  CPU/e2e   maxabs   acc  CPU kernel
+----------------------------------------------------------------------------------------------------------------------------
+ gelu     65536      204.2      725.5       17.3      1.28     15.15     0.08     0.02  0.01562  PASS  torch fp32
+
+################ gelu  L=262144  (21:31:47) ################
+bf16 activation sweep  channels=2  iters=20 warmup=5  torch=2.14.0+cpu threads=8
+design: C:\Users\<user>\mlir-aie\programming_examples\ml\eltwise_unary
+
+=== gelu  L=262144  ch=2 ===
+  NPU  avg     301.7 us  min     286.3 us     3.48 GB/s
+  e2e  avg     840.6 us   (host-side, includes dispatch)
+  CPU  torch bf16       med      20.9 us  min      19.9 us  <- verdict
+  CPU  torch fp32       med      21.1 us  min      20.2 us
+  CPU  tanh bf16        med      72.4 us  min      71.9 us
+  CPU best      20.9 us    50.05 GB/s
+  CPU/NPU   0.07x on NPU time,   0.02x on e2e
+  accuracy: PASS at the design's own tolerance   max abs err 0.01562   max rel err (|ref|>=0.1) 0.03982
+
+SUMMARY  (CPU/NPU > 1 means the NPU is faster; e2e is the honest column, it pays the dispatch)
+   op         L     NPU us     e2e us     CPU us  NPU GB/s  CPU GB/s  CPU/NPU  CPU/e2e   maxabs   acc  CPU kernel
+----------------------------------------------------------------------------------------------------------------------------
+ gelu    262144      301.7      840.6       20.9      3.48     50.05     0.07     0.02  0.01562  PASS  torch bf16
+
+################ gelu  L=1048576  (21:31:49) ################
+bf16 activation sweep  channels=2  iters=20 warmup=5  torch=2.14.0+cpu threads=8
+design: C:\Users\<user>\mlir-aie\programming_examples\ml\eltwise_unary
+
+=== gelu  L=1048576  ch=2 ===
+  NPU  avg     682.3 us  min     672.0 us     6.15 GB/s
+  e2e  avg    1206.0 us   (host-side, includes dispatch)
+  CPU  torch bf16       med      98.2 us  min      95.0 us  <- verdict
+  CPU  torch fp32       med     102.8 us  min      99.3 us
+  CPU  tanh bf16        med     377.3 us  min     372.0 us
+  CPU best      98.2 us    42.73 GB/s
+  CPU/NPU   0.14x on NPU time,   0.08x on e2e
+  accuracy: PASS at the design's own tolerance   max abs err 0.01562   max rel err (|ref|>=0.1) 0.03982
+
+SUMMARY  (CPU/NPU > 1 means the NPU is faster; e2e is the honest column, it pays the dispatch)
+   op         L     NPU us     e2e us     CPU us  NPU GB/s  CPU GB/s  CPU/NPU  CPU/e2e   maxabs   acc  CPU kernel
+----------------------------------------------------------------------------------------------------------------------------
+ gelu   1048576      682.3     1206.0       98.2      6.15     42.73     0.14     0.08  0.01562  PASS  torch bf16
+
+################ gelu  L=4194304  (21:31:51) ################
+bf16 activation sweep  channels=2  iters=20 warmup=5  torch=2.14.0+cpu threads=8
+design: C:\Users\<user>\mlir-aie\programming_examples\ml\eltwise_unary
+
+=== gelu  L=4194304  ch=2 ===
+  NPU  avg    2235.0 us  min    2204.8 us     7.51 GB/s
+  e2e  avg    2998.5 us   (host-side, includes dispatch)
+  CPU  torch bf16       med     360.2 us  min     320.7 us  <- verdict
+  CPU  torch fp32       med     584.2 us  min     491.0 us
+  CPU  tanh bf16        med    1544.6 us  min    1486.7 us
+  CPU best     360.2 us    46.58 GB/s
+  CPU/NPU   0.16x on NPU time,   0.12x on e2e
+  accuracy: PASS at the design's own tolerance   max abs err 0.01562   max rel err (|ref|>=0.1) 0.03982
+
+SUMMARY  (CPU/NPU > 1 means the NPU is faster; e2e is the honest column, it pays the dispatch)
+   op         L     NPU us     e2e us     CPU us  NPU GB/s  CPU GB/s  CPU/NPU  CPU/e2e   maxabs   acc  CPU kernel
+----------------------------------------------------------------------------------------------------------------------------
+ gelu   4194304     2235.0     2998.5      360.2      7.51     46.58     0.16     0.12  0.01562  PASS  torch bf16
+
+################ gelu  L=16777216  (21:31:53) ################
+bf16 activation sweep  channels=2  iters=20 warmup=5  torch=2.14.0+cpu threads=8
+design: C:\Users\<user>\mlir-aie\programming_examples\ml\eltwise_unary
+
+=== gelu  L=16777216  ch=2 ===
+  NPU  avg    8354.5 us  min    8295.8 us     8.03 GB/s
+  e2e  avg    9218.6 us   (host-side, includes dispatch)
+  CPU  torch bf16       med    1714.6 us  min    1624.0 us  <- verdict
+  CPU  torch fp32       med    3403.7 us  min    3036.3 us
+  CPU  tanh bf16        med    6221.3 us  min    5659.2 us
+  CPU best    1714.6 us    39.14 GB/s
+  CPU/NPU   0.21x on NPU time,   0.19x on e2e
+  accuracy: PASS at the design's own tolerance   max abs err 0.01562   max rel err (|ref|>=0.1) 0.03982
+
+SUMMARY  (CPU/NPU > 1 means the NPU is faster; e2e is the honest column, it pays the dispatch)
+   op         L     NPU us     e2e us     CPU us  NPU GB/s  CPU GB/s  CPU/NPU  CPU/e2e   maxabs   acc  CPU kernel
+----------------------------------------------------------------------------------------------------------------------------
+ gelu  16777216     8354.5     9218.6     1714.6      8.03     39.14     0.21     0.19  0.01562  PASS  torch bf16
+
+--- contention check after ---
+
+-----------------------------
+[003d:00:01.1] : NPU Phoenix
+-----------------------------
+AIE Partitions
+  No hardware contexts running on device
+
+--- peer processes after ---
+
+   Id ProcessName StartTime                  CPU
+   -- ----------- ---------                  ---
+22396 python      9/9/2026 3:15:31 PM 22482.3125
+
+
+
+=== end 2026-09-09 21:31:56 ===

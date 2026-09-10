@@ -660,6 +660,25 @@ got the same oracle. Patching `whole_array.py` changes its JIT-cache hash, so th
 each config recompiles (seconds). CPU timings were taken beside another session's yolov6n
 evaluation runs. Cited by [`kernels/README.md`](../../kernels/README.md).
 
+**`bf16_activation_sweep_npu.log`** — the timing half of a result this repo had only
+half-taken: `mlir_aie_ml_examples_npu.log` recorded ReLU/SiLU/GELU as `PASS!` but never
+timed them. Timed now against Zen 4 torch, 15 rows each in its own process:
+**the NPU loses at every op and every size, end to end**, best case 0.77× (ReLU at 16.7M
+elements). The only crossing anywhere is ReLU at 16.7M on NPU-time-only, 1.09×. Mechanism:
+ReLU reaches 52.43 GB/s and is still climbing while SiLU flattens at 11.20 and GELU at
+8.03 on identical byte volume — the LUT ops are core-limited, not DMA-limited — and e2e
+minus NPU time is 500–560 µs on every ReLU row, the 531–617 µs IRON dispatch floor
+arriving again from an unrelated design. **Accuracy is the positive half:** all rows pass
+with room to spare (SiLU max rel 5.48%, GELU 3.98%, against a 12.8% allowance), and both
+max-abs errors are exact bf16 quantization steps, so the error looks like bf16 rounding
+rather than LUT error. **Two methodology traps recorded, each of which produced a
+confident wrong number first** — timing only bf16 `F.silu` would have read "1.97× NPU
+win" where the fastest CPU kernel gives 0.51× (torch's bf16 SiLU is 3.9× slower than its
+own fp32), and timing all variants in one interpreter made that call read 2,606 µs against
+11,820/12,904 µs isolated (that 5× is **unexplained**). Standalone dispatches only — a
+fused activation epilogue is untested and is the live question. Written up in
+[`docs/BENCHMARKS.md`](../../docs/BENCHMARKS.md#bf16-activations-correct-accurate-and-never-worth-the-dispatch).
+
 **`int16_matmul_sweep_npu.log`** — the 16-bit GEMM throughput the backlog had asked for,
 and the finding that the question was half mis-posed. **Carries its own `CORRECTION`
 appendix**, and the correction is the more interesting half: the log first read

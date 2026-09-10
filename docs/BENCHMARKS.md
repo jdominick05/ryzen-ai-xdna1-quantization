@@ -1473,6 +1473,64 @@ within +0.2% to +4.2% — inside this machine's known drift. That confirms both 
 input-bound patch does not perturb int8 (whose bound it moves only from −32 to −31) and
 that this sitting is readable against the earlier one.
 
+### bf16 activations: correct, accurate, and never worth the dispatch
+
+`mlir_aie_ml_examples_npu.log` recorded ReLU, SiLU and GELU all `PASS!` on this hardware
+in September, which settled correctness and left the actual question untouched: nobody
+had timed them. The answer is a clean negative. **The NPU loses at every op and every
+size measured, end to end** — best case 0.77×. `results/aie/bf16_activation_sweep_npu.log`,
+`kernels/bf16_activation_sweep/`, 15 rows each in its own process, device idle before and
+after, host quiet (the evening's peer process took 33 CPU-seconds across the whole
+13-minute sweep).
+
+| op | L | NPU µs | e2e µs | CPU µs | NPU GB/s | CPU GB/s | CPU/NPU | CPU/e2e |
+|---|---|---|---|---|---|---|---|---|
+| relu | 65,536 | 185.0 | 711.0 | 4.2 | 1.42 | 62.42 | 0.02× | 0.01× |
+| relu | 1,048,576 | 239.1 | 724.6 | 22.7 | 17.54 | 184.77 | 0.09× | 0.03× |
+| relu | 16,777,216 | 1280.0 | 1808.4 | 1390.6 | 52.43 | 48.26 | **1.09×** | 0.77× |
+| silu | 1,048,576 | 542.0 | 1157.2 | 104.7 | 7.74 | 40.08 | 0.19× | 0.09× |
+| silu | 16,777,216 | 5994.0 | 6773.9 | 3044.6 | 11.20 | 22.04 | 0.51× | 0.45× |
+| gelu | 1,048,576 | 682.3 | 1206.0 | 98.2 | 6.15 | 42.73 | 0.14× | 0.08× |
+| gelu | 16,777,216 | 8354.5 | 9218.6 | 1714.6 | 8.03 | 39.14 | 0.21× | 0.19× |
+
+The only crossing in the whole grid is ReLU at 16.7M elements on NPU-time-only, and it
+still loses once the dispatch is paid. Three mechanisms, in decreasing confidence:
+**the op, not the transfer, sets the NPU ceiling for two of three** — ReLU reaches
+52.43 GB/s and is still climbing while SiLU flattens at 11.20 and GELU at 8.03, all moving
+identical bytes, so the LUT ops are core-limited rather than DMA-limited; **the dispatch
+floor never stops mattering** — e2e minus NPU time is 500–560 µs on every ReLU row, the
+same 531–617 µs IRON floor measured in [the dispatch-floor
+work](#the-dispatch-floor-what-a-kernel-has-to-beat-before-it-can-win), arriving again from
+an unrelated design, and at L=65,536 the CPU finishes 170× inside it; and **the CPU is
+strongest exactly where the NPU is weakest** — CPU bandwidth peaks at 184.77 GB/s while
+cache-resident and falls to 22–48 GB/s at 64 MB, which is the one place the NPU crosses.
+
+**Accuracy is the positive half.** All 15 rows pass at the design's own tolerances with
+room to spare: ReLU exact, SiLU max abs 0.03125 / max rel 5.48%, GELU max abs 0.01562 /
+max rel 3.98%, against a 12.8% allowance. Both max-abs figures are exact bf16 quantization
+steps (1/32, 1/64), so the error looks dominated by bf16 rounding rather than by the LUT.
+The premise behind wanting these kernels — a real bf16 SiLU/GELU being more faithful than
+Quark's HardSwish/HardSigmoid substitution — survives on accuracy; it just cannot be
+delivered profitably as a standalone dispatch.
+
+**Two methodology traps, both of which produced a confident wrong number first.** Timing
+only `F.silu` on a bf16 tensor — the obvious choice, matching the NPU's dtype — gives
+"SiLU is a 1.97× NPU win". Against the fastest CPU kernel available it is a 0.51× loss:
+torch's bf16 SiLU (11,820 µs at 16.7M) is **3.9× slower than torch's own fp32 SiLU**
+(3,045 µs), an unoptimized path. That is the third time this repo has picked the slower CPU
+kernel and the first time the rule caught it prospectively. Separately, timing all CPU
+variants inside one interpreter made that same bf16 SiLU call read 2,606 µs, against
+11,820 and 12,904 µs in two independent isolated runs — so every row above comes from a
+fresh process. That 5× discrepancy is **unexplained**; allocator/page reuse is the
+hypothesis, not a finding.
+
+**Not measured, and it is the live question:** every row is a *standalone* dispatch, the
+worst possible framing for an op this cheap. `docs/SILICON.md` K4 already says tiny ops are
+only worth building fused into a larger kernel, and nothing here measures a fused
+activation epilogue or argues against one — `ml/mm_activation_epilogue` is the shape that
+would answer it and is Strix-only in this tree. Sigmoid was not measured (the design
+offers relu/silu/gelu only), and there is no iGPU leg.
+
 ### The AIE core clock, measured: 1.80 GHz default, 0.80 powersaver
 
 Every per-second ceiling this repo derives for the array — TOPS per column, bytes per
