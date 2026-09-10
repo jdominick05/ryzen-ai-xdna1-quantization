@@ -498,3 +498,53 @@ AIE Partitions
 
 
 === end 2026-09-09 21:31:56 ===
+
+================================================================================
+CORRECTION (2026-09-09, same session, before this log was cited)
+================================================================================
+Two errors above, both in the analysis rather than the measurement. Appended rather than
+edited, per this directory's convention.
+
+**1. The four-line SiLU table in METHODOLOGY mixed two processes -- inside the section
+that exists to explain why that is unsafe.** It listed:
+
+  torch fp32 silu      3044.6 us   <- from the ISOLATED GRID row
+  x*sigmoid bf16       4285.2 us   <- from the separate isolated RE-CHECK
+  x*sigmoid fp32       7455.0 us   <- re-check
+  torch bf16 silu     11820.4 us   <- re-check
+
+The grid's own four CPU lines at silu / L=16,777,216, all from ONE process, are in the raw
+output below and read:
+
+  torch fp32 silu      3044.6 us  (min 2990.9)   <- verdict
+  x*sigmoid bf16       4323.6 us  (min 4108.2)
+  x*sigmoid fp32       7344.3 us  (min 7134.4)
+  torch bf16 silu     11761.4 us  (min 11481.5)
+
+**The claim survives and the figure moves slightly: torch's bf16 SiLU is 3.86x slower than
+torch's own fp32 SiLU** (11761.4 / 3044.6), not the 3.9x quoted from the mixed table. The
+"had I timed only bf16" counterfactual is likewise 11761.4 / 5994.0 = **1.96x**, not 1.97x.
+Both legs of that comparison now come from the same process, which is what the rest of the
+log requires of every other row.
+
+The separate re-check run remains useful and is not withdrawn -- it is the independent
+confirmation that torch-bf16 SiLU really does cost ~11.8 ms at this shape (11820.4 us
+there against 11761.4 us here, 0.5% apart), which is what refuted the 2606 us outlier. It
+just should not have been spliced into a single table with grid numbers.
+
+**2. "e2e minus NPU time is 500-560 us on every ReLU row" is contradicted by the table it
+describes.** The actual differences are:
+
+  L=65,536      711.0 - 185.0 = 526.0 us
+  L=262,144     727.9 - 196.6 = 531.3 us
+  L=1,048,576   724.6 - 239.1 = 485.5 us
+  L=4,194,304  1044.8 - 466.9 = 577.9 us
+  L=16,777,216 1808.4 - 1280.0 = 528.4 us
+
+so the range is **485-578 us**, not 500-560. The point that sentence was making is
+unaffected and if anything slightly stronger: the spread is host-side dispatch overhead
+that does not scale with payload, and it still brackets the 531-617 us one-shot IRON floor
+measured independently in dispatch_floor_npu.log.
+
+Neither correction touches the verdict: the NPU still loses at every op and every size
+end-to-end, best case 0.77x.

@@ -1498,8 +1498,8 @@ still loses once the dispatch is paid. Three mechanisms, in decreasing confidenc
 **the op, not the transfer, sets the NPU ceiling for two of three** — ReLU reaches
 52.43 GB/s and is still climbing while SiLU flattens at 11.20 and GELU at 8.03, all moving
 identical bytes, so the LUT ops are core-limited rather than DMA-limited; **the dispatch
-floor never stops mattering** — e2e minus NPU time is 500–560 µs on every ReLU row, the
-same 531–617 µs IRON floor measured in [the dispatch-floor
+floor never stops mattering** — e2e minus NPU time is 485–578 µs across the ReLU rows with no
+trend in payload, bracketing the 531–617 µs IRON floor measured in [the dispatch-floor
 work](#the-dispatch-floor-what-a-kernel-has-to-beat-before-it-can-win), arriving again from
 an unrelated design, and at L=65,536 the CPU finishes 170× inside it; and **the CPU is
 strongest exactly where the NPU is weakest** — CPU bandwidth peaks at 184.77 GB/s while
@@ -1515,12 +1515,13 @@ delivered profitably as a standalone dispatch.
 
 **Two methodology traps, both of which produced a confident wrong number first.** Timing
 only `F.silu` on a bf16 tensor — the obvious choice, matching the NPU's dtype — gives
-"SiLU is a 1.97× NPU win". Against the fastest CPU kernel available it is a 0.51× loss:
-torch's bf16 SiLU (11,820 µs at 16.7M) is **3.9× slower than torch's own fp32 SiLU**
-(3,045 µs), an unoptimized path. That is the third time this repo has picked the slower CPU
+"SiLU is a 1.96× NPU win". Against the fastest CPU kernel available it is a 0.51× loss:
+torch's bf16 SiLU (11,761 µs at 16.7M) is **3.86× slower than torch's own fp32 SiLU**
+(3,045 µs), an unoptimized path — both figures from the same process, as the rest of this
+section requires. That is the third time this repo has picked the slower CPU
 kernel and the first time the rule caught it prospectively. Separately, timing all CPU
 variants inside one interpreter made that same bf16 SiLU call read 2,606 µs, against
-11,820 and 12,904 µs in two independent isolated runs — so every row above comes from a
+11,761 and 11,820 µs in two independent isolated runs — so every row above comes from a
 fresh process. That 5× discrepancy is **unexplained**; allocator/page reuse is the
 hypothesis, not a finding.
 

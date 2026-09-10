@@ -660,7 +660,15 @@
   `--dtype_in i8 --dtype_out i32` (i32 for the same accumulate-in-`dtype_out` reason as
   above), against the CPU's own int8 GEMM kernels — torch `_int_mm` and ORT
   `MatMulInteger` u8s8, both timed because this repo has twice lost a verdict to the slower
-  CPU kernel; torch's is 1.05–1.68× faster here and is the verdict line. At the default
+  CPU kernel; torch's is 1.05–1.68× faster here and is the verdict line. **A third exemplar
+  landed 2026-09-09, and it is the sharpest: matching the NPU's dtype on the CPU side is not
+  the same as giving the CPU its best shot.** Timing bf16 activations against `F.silu` on a
+  bf16 tensor — the obvious like-for-like choice — reads "SiLU is a 1.96× NPU win", because
+  torch's bf16 SiLU is an unoptimized path **3.86× slower than torch's own fp32 SiLU**
+  (11,761 vs 3,045 µs at 16.7M elements). Against the fastest CPU kernel it is a 0.51×
+  loss. Time several CPU implementations *including other dtypes* and let the fastest be
+  the verdict; see `results/aie/bf16_activation_sweep_npu.log`, which also records that
+  timing those variants inside one interpreter corrupted an absolute CPU timing by 5×. At the default
   m=64/k=64/n=32: int8 runs only 1.1–1.5× the bf16 rate (not the 2× the MAC count
   promises) and loses to the CPU's int8 kernel at every shape but 1024³. The default tile
   is bound by dtype-blind costs — the design re-streams A from DDR N/(n·4) times and B
@@ -867,6 +875,17 @@ anywhere. It tells you what landed where, never why.
   compiles. The cut model's report puts **all 57 `HardSigmoid`, all 16 `Slice`, both
   `Resize` and all 13 `Concat` on the NPU**. Every one is supported by the X1
   overlay. Do not re-run this hypothesis.
+
+  **Related, and it closes the "just write a real SiLU" follow-up (2026-09-09):** the
+  standing idea was that a hand-written bf16 SiLU/GELU on the array would avoid this
+  substitution's fidelity cost. Measured, the accuracy half holds — mlir-aie's bf16
+  activations run at 5.48% (SiLU) and 3.98% (GELU) max relative error, well inside their
+  12.8% allowance, with the error dominated by bf16 rounding rather than the LUT. The
+  economics do not: as a *standalone* dispatch they lose to the CPU at every op and size,
+  best case 0.77× end-to-end, because a 531–617 µs dispatch floor buys an op the CPU
+  finishes in microseconds. So the substitution is not worth replacing op-by-op; the only
+  live route is folding the activation into a kernel already being dispatched.
+  `results/aie/bf16_activation_sweep_npu.log`.
 - **Not `subgraphs_to_exclude`.** Real field on the legacy `QuantizationConfig`,
   consumed by `quantize.py:391`, and `quant_utils.py::match_subgraphs` *raises*
   rather than no-ops if the subgraph doesn't match. It either works or it throws; it

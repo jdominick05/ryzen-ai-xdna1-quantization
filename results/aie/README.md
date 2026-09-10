@@ -672,10 +672,13 @@ arriving again from an unrelated design. **Accuracy is the positive half:** all 
 with room to spare (SiLU max rel 5.48%, GELU 3.98%, against a 12.8% allowance), and both
 max-abs errors are exact bf16 quantization steps, so the error looks like bf16 rounding
 rather than LUT error. **Two methodology traps recorded, each of which produced a
-confident wrong number first** — timing only bf16 `F.silu` would have read "1.97× NPU
-win" where the fastest CPU kernel gives 0.51× (torch's bf16 SiLU is 3.9× slower than its
+confident wrong number first** — timing only bf16 `F.silu` would have read "1.96× NPU
+win" where the fastest CPU kernel gives 0.51× (torch's bf16 SiLU is 3.86× slower than its
 own fp32), and timing all variants in one interpreter made that call read 2,606 µs against
-11,820/12,904 µs isolated (that 5× is **unexplained**). Standalone dispatches only — a
+11,761/11,820 µs isolated (that 5× is **unexplained**). The log carries a `CORRECTION`
+appendix: its first METHODOLOGY table spliced numbers from two processes, which is the
+very thing that section warns against — rebuilt from one process, the ratio moved 3.9→3.86
+and the claim stood. Standalone dispatches only — a
 fused activation epilogue is untested and is the live question. Written up in
 [`docs/BENCHMARKS.md`](../../docs/BENCHMARKS.md#bf16-activations-correct-accurate-and-never-worth-the-dispatch).
 
