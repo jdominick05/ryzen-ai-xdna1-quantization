@@ -46,7 +46,7 @@ array program) into `~/.npu/cache/<hash>/`; later runs of the same shape hit the
 | `asm_probe/` | Nothing — asks whether hand-written AIE2 assembly is usable | **It assembles and links.** Only statement-level inline asm fails. Compile only, no NPU |
 | `bank_placement/` | A local copy of `whole_array.py` plus `--stack-size`, and an alternating A/B driver | Tests H12: does separating the int8 GEMM's colliding operands into different memory banks speed it up? **Not resolvable on a shared machine** — seven series, arms overlap, sign varies. Its `bank_stall_probe.py` is a **superseded** control whose headline was retracted; the working observable is `memory_placement/` |
 | `conv_accum/` | Local copies of both 1×1 conv kernels with their accumulators made register-resident | **Worth 2.99–3.01×** (116 → 350 marginal GOPS); hot loop 0.045 → 0.286 MACs/cycle. **The op class stays closed** — CPU still wins 2.4×, down from 7.2× |
-| `w4a8_probe/` | Nothing yet — int4 weights on one core, two ways: native `mmul<int8,int4>`, and int4 widened to int8 on load | **int8×int4 is a native `vmac` on AIE2**, bit-exact, one per cycle at 512 MACs: a k loop at 372.4 MAC/cycle, 1.82× upstream's int8 loop. Widening on load is free and buys only bytes. One core, not the array |
+| `w4a8_probe/` | Nothing yet — int4 weights on one core, two ways: native `mmul<int8,int4>`, and int4 widened to int8 on load | **int8×int4 is a native `vmac` on AIE2**, bit-exact, one per cycle at 512 MACs: a k loop at 372.4 MAC/cycle, 1.82× the int8 control (upstream's kernel, re-typed). Widening on load is free and buys only bytes. One core, not the array |
 
 Each kernel's own findings, warnings and retractions follow. They are prose rather than
 table cells because several of them are corrections to what an earlier version of this
@@ -480,10 +480,13 @@ the unpack cost. `results/aie/w4a8_probe_npu.log`, written up in
 
 Three things worth knowing before writing another kernel here:
 
-- **An IRON build ignores `aie_kernel_utils.h`'s loop hints.** IRON's compile defines neither
-  `__chess__` nor `__AIECC__`, so every `AIE_LOOP_*` macro is empty there. The native loop only
-  pipelines with its k loop unrolled twice, and that has to be a raw `_Pragma` in the source
-  (`-DINNER_UNROLL2`): 0.5 → 0.8 `vmac` per cycle.
+- **Upstream's k-loop hint never reaches Peano; `AIE_LOOP_UNROLL` does.** Peano predefines
+  `__AIECC__` (check with `clang++ -dM -E` — it is not on IRON's command line), so in an IRON
+  build `AIE_LOOP_UNROLL`/`AIE_LOOP_MIN_ITERATION_COUNT` become `clang loop` pragmas, while
+  `AIE_LOOP_FLATTEN` — the only hint on upstream `mm.cc`'s k loop — and
+  `AIE_PREPARE_FOR_PIPELINING` are empty. The native loop only pipelines with its k loop
+  unrolled twice (`-DINNER_UNROLL2`, the same object as `AIE_LOOP_UNROLL(2)`): 0.5 → 0.8 `vmac`
+  per cycle.
 - **"Spill" in a static table is a schedule shape, not a verdict.** At K=64 the default build of
   the unpack kernel unrolls fully and spills (1,312-byte frame) and is still faster per call than
   every int8 arm, because the big loop absorbs the C loads. Measure before believing either way.
