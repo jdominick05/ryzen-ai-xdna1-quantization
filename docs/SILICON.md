@@ -560,9 +560,18 @@ attribution is unambiguous there too: the iGPU's cores fall *below* idle while i
 takes +47.09 W, placing the 780M in the SoC domain, and the NPU takes +8.96 W residual for
 +1.16 W of cores. `results/aie/power_rapl_resnet50_joules_per_frame.log`,
 [joules per frame](BENCHMARKS.md#joules-per-frame-the-npu-does-113-the-inferences-per-joule-of-the-cpu-59-the-igpu).
-Still open: batch 1 and one model only, 60 s windows rather than sustained thermal steady
-state, throughput and power captured in separate windows, and a residual that is an upper
-bound rather than an isolate (uncore + SoC + NPU + memory controller).
+**Confirmed on a second, adversarial model the next day:** BiSeNetV2, where the NPU's
+*latency* lead over the iGPU is documented as narrowest (1.09×) — the sharpest available
+test of whether the energy edge merely rides a speed edge. That sitting's own clean
+throughput actually put the iGPU 1.056× *faster* (a coin-flip reversal consistent with
+known session-to-session drift, not a regression), yet the NPU still ran **3.46–5.92×**
+more efficiently across a full sensitivity range needed because that sitting's idle phases
+disagreed 41% (active workload phases stayed tight). `results/aie/power_rapl_bisenetv2_joules_per_frame.log`.
+Still open: batch 1 only, 60 s windows rather than sustained thermal steady state,
+throughput and power captured in separate windows, a residual that is an upper bound
+rather than an isolate (uncore + SoC + NPU + memory controller), and — new from the
+BiSeNetV2 sitting — the core-vs-residual attribution that worked cleanly on ResNet50 does
+not transfer when the idle floor itself is this noisy.
 `results/aie/power_rapl_bf16_gemm_npu_vs_cpu.log`,
 [BENCHMARKS](BENCHMARKS.md#the-first-watt-the-npu-is-133-faster-and-445-cheaper-on-the-same-gemm).
 Original entry, kept because its reasoning is what made the measurement designable:

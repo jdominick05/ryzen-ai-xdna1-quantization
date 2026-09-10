@@ -1,0 +1,239 @@
+Joules per frame for BiSeNetV2 (512x512 segmentation) -- a second model family, chosen
+because it is the case where this repo's own docs record the NPU's latency lead over the
+iGPU as narrowest (1.09x DML). The energy finding survives that test decisively: **the NPU
+runs 3.5-5.9x more efficiently than the iGPU and an order of magnitude more efficiently
+than the CPU, even though the raw-speed race between NPU and iGPU is close enough to flip
+direction between sittings.**
+Desktop 2 (Ryzen 7 8700G / Phoenix XDNA1 / Radeon 780M), DESKTOP-CBL5NUA, 2026-09-10,
+08:53-09:07. Six power phases in one sitting, 60 s sampled each, 15 s settle between
+phases; throughput measured in a FULLY SEPARATE pass afterward (see METHODOLOGY -- this is
+the fix for the contamination `power_rapl_resnet50_joules_per_frame.log` found and
+retracted). `xrt-smi` clean before and after.
+
+WHY THIS MODEL
+==============
+`power_rapl_resnet50_joules_per_frame.log` established the shape of the finding on a
+classification CNN where the NPU already wins comfortably on latency (2.80x over CPU,
+1.34x over iGPU). That leaves open whether the energy edge is a byproduct of also being
+faster, or whether it holds independently. BiSeNetV2 is the sharpest available test:
+`docs/BENCHMARKS.md`'s own Category B result puts the NPU only 1.09x ahead of DML on
+latency, the closest race in this repo between those two providers on any model.
+
+THE IDLE BASELINE HERE IS NOISY, AND THAT IS REPORTED RATHER THAN HIDDEN
+=========================================================================
+Unlike the ResNet50 sitting, where idle phases A and F agreed to 0.8% on the median, here
+they disagree by **41%** (A 18.846 W, F 26.610 W median package power). This is not a
+fluke of one sample: the RANGE within each idle phase is itself unusually wide (A: 15.35-
+39.90 W, a 24.55 W spread; F: 16.53-64.78 W, a 48.25 W spread), while every ACTIVE workload
+phase is comparatively tight (7.50-22.37 W spread). That pattern -- noise concentrated in
+the idle phases, not the busy ones -- is consistent with background OS activity (Defender,
+Search indexing, telemetry, Windows Update checks) being a large relative perturbation
+against a near-zero true-idle floor and a small one against an already-busy package; it is
+not chased further than that observation. The peer process from the two prior studies
+(PID 22396) had exited before this sitting, which may itself be relevant -- with no
+sustained ~1-core background load holding the package off its deepest idle states, the
+package may swing more between deep-idle and OS-housekeeping bursts.
+
+**Consequence: no single idle baseline is asserted.** Every energy figure below is reported
+as a range across the two plausible baselines (the lower and higher of the A/F medians)
+plus their mean, rather than as one point estimate the way the ResNet50 log could.
+
+WHAT WAS RUN
+============
+Same instruments as the ResNet50 study: `tools/power_probe.py` (RAPL via PDH) and
+`tools/session_hold.py --ep {npu,cpu,dml}`. Models: `bisenetv2_fp32.onnx` (B, C) and
+`bisenetv2_fp32_xint8.onnx` (D, E), cache key `bisenetv2cachekey`, single stream, batch 1,
+512x512x3 in / 512x512x19 logits out.
+
+  A idle -> B CPU fp32 -> C iGPU/DML fp32 -> D NPU xint8 -> E CPU xint8 -> F idle again
+  (then, separately, in its own pass with 8 s settle between arms:)
+  throughput: B -> C -> E -> D
+
+RESULT
+======
+Medians, all six phases:
+
+  phase                 package    cores sum   residual    fps (clean pass)
+  ----------------------------------------------------------------------------
+  A idle                 18.846 W     3.514 W    15.332 W     --
+  B CPU fp32             77.937 W    53.024 W    24.913 W    20.7
+  C iGPU (DML) fp32      76.283 W     7.942 W    68.341 W    79.3
+  D NPU xint8            34.557 W     7.021 W    27.536 W    75.1
+  E CPU xint8 (control)  63.325 W    42.090 W    21.235 W    11.5
+  F idle again           26.610 W     9.694 W    16.916 W     --
+
+Because the idle range spans 18.846-26.610 W, energy figures are given across that range
+(low / mean / high) rather than at one point:
+
+  arm                   J/frame @idle_lo   @idle_mean   @idle_hi
+  ---------------------------------------------------------------
+  CPU fp32                    2.8546          2.6671       2.4796
+  iGPU (DML) fp32             0.7243          0.6754       0.6264
+  **NPU xint8**               **0.2092**      **0.1575**   **0.1058**
+  CPU xint8 (control)         3.8677          3.5302       3.1926
+
+  NPU vs CPU fp32  : 13.65x (idle_lo) -- 16.93x (mean) -- 23.43x (idle_hi)
+  NPU vs iGPU      :  3.46x (idle_lo) --  4.29x (mean) --  5.92x (idle_hi)
+  NPU vs CPU xint8 : 18.49x (idle_lo) -- 22.41x (mean) -- 30.17x (idle_hi)
+
+**Across the ENTIRE plausible baseline range, the ranking never changes and the NPU never
+drops below 3.46x the iGPU or 13.65x the CPU.** The exact multiple is uncertain by roughly
+1.7x end to end (a direct consequence of the idle noise above); the order of magnitude and
+the ranking (NPU >> iGPU > CPU) are not.
+
+THE SHARPEST FINDING: LATENCY IS A COIN FLIP, ENERGY IS NOT
+=============================================================
+This session's clean throughput pass reads NPU 75.1 fps against iGPU 79.3 fps -- **the
+iGPU is 1.056x FASTER than the NPU here**, the opposite direction from
+`docs/BENCHMARKS.md`'s recorded 1.086x NPU-over-DML for the same model family. Both
+figures are close enough to 1.0 that this is a coin flip across sittings, consistent with
+this repo's own documented finding that NPU/DML latency drifts session to session (the
+12.7 ms vs 6.9 ms example already in `CLAUDE.md`) -- **not** claimed here as a regression,
+just as two independent measurements of a near-tie.
+
+The energy result does not share that ambiguity at any point in the sensitivity range: the
+NPU is **3.46x-5.92x more efficient than the iGPU regardless of which sitting's latency
+number you believe.** This is the cleanest available evidence in this repo that the energy
+advantage is not merely riding on a speed advantage -- on the one model where speed alone
+would call the NPU a wash or a narrow loss against the iGPU, energy calls it decisively.
+
+THE DTYPE CONTROL REPRODUCES
+=============================
+As with ResNet50, the CPU-on-the-same-INT8-artifact control moves the WRONG way for the
+"int8 is just cheaper" hypothesis: CPU xint8 is **slower** than CPU fp32 (11.5 vs 20.7 fps)
+and **worse on energy at every baseline** (3.53 vs 2.67 J/frame at the mean). ONNX
+Runtime's QDQ int8 path costs this CPU throughput AND energy on a second, structurally
+different model (segmentation, not classification), which is a second independent
+instance of the same pessimization `power_rapl_resnet50_joules_per_frame.log` found.
+
+ATTRIBUTION IS NOT AS CLEAN HERE AS IN THE RESNET50 SITTING, AND THAT IS STATED PLAINLY
+=========================================================================================
+The ResNet50 log could say cleanly "iGPU cores drop below idle, NPU cores barely move"
+because that sitting's idle floor was tight and well below every workload's core reading.
+Here the idle core median itself ranges from 3.51 W (A) to 9.69 W (F) -- overlapping the
+NPU phase's own 7.02 W core median and close to the iGPU phase's 7.94 W. **No confident
+core-vs-residual attribution is drawn from this sitting alone.** The package-level ranking
+is unaffected (it does not depend on the core split), but readers should look to the
+ResNet50 log for the provider-attribution mechanism, not this one.
+
+METHODOLOGY -- the ResNet50 contamination did not recur
+==========================================================
+This run separates throughput measurement from power sampling entirely: all six power
+phases run first (each with a 15 s settle after), THEN a fully independent throughput pass
+runs each arm with an 8 s settle between them. No throughput figure here shows the
+halving signature the ResNet50 study found and retracted (compare: this sitting's NPU fps
+is 75.1 with `power_probe.py`'s own single post-compile sample reading 69.3 -- close, not
+half -- so the fix holds). All four throughput readings are internally stable (12 one-
+second intervals per arm; see raw output).
+
+An unrelated workflow error occurred and is noted for completeness, not because it
+affected any data: after this study completed, a follow-up shell invocation accidentally
+re-ran the whole script with a stray `--help` argument (which the script does not parse,
+so it just ran again) before being caught and killed a few dozen seconds in, inside phase
+B of the restarted run. It was caught before phase A of the restart finished, two orphaned
+`python.exe` processes were terminated, and `xrt-smi` confirmed no hardware context was
+left open. It overwrote the standalone `.jsonl` phase file with a partial restart, which is
+irrelevant because the complete original six-phase data was already captured in this log's
+own stdout (below) before the restart began.
+
+WHAT THIS DOES NOT ESTABLISH
+============================
+- **The idle baseline uncertainty is the headline caveat.** A 41% idle-to-idle disagreement
+  is a real limitation, not resolved here beyond bounding it with a sensitivity range.
+  Repeating this sitting under `--pmode` fixed to a specific power plan, or sampling a
+  longer idle window, are the obvious next steps if a tighter number is wanted.
+- **One model, batch 1, single stream** -- same scope limits as the ResNet50 log.
+- **Not sustained thermal steady state** -- 60 s windows.
+- **Throughput and power still come from separate windows** minutes apart.
+- **The NPU residual is an upper bound**, and the core-attribution argument that
+  strengthened the ResNet50 reading does not transfer cleanly here (see above).
+- **No accuracy axis** -- BiSeNetV2 XINT8's own known fixed-point fidelity issue on
+  physical hardware (`docs/BENCHMARKS.md`, Category B) is a separate, already-documented
+  finding and is not re-examined by this energy measurement.
+
+RAW OUTPUT
+================================================================================
+[2m    env: resnet_env17  (3.12.11)[0m
+=== BiSeNetV2 joules-per-frame: CPU vs iGPU vs NPU. start 2026-09-10 08:53:03 ===
+host: DESKTOP-CBL5NUA
+--- device before ---
+-----------------------------
+AIE Partitions
+  No hardware contexts running on device
+
+
+### phase A: idle baseline
+=== A_idle ===
+  package   mean  21.366 W   min  15.346   max  39.900   n=59
+  cores sum mean   6.078 W   min   2.425   max  28.466
+  package - cores   15.288 W   (uncore + SoC + NPU; NOT an NPU figure on its own)
+### phase B: CPU fp32
+=== B_cpu_fp32 ===
+  package   mean  77.545 W   min  72.927   max  80.429   n=59
+  cores sum mean  52.862 W   min  48.619   max  59.790
+  package - cores   24.683 W   (uncore + SoC + NPU; NOT an NPU figure on its own)
+### phase C: iGPU (DML) fp32
+=== C_dml_fp32 ===
+  package   mean  78.682 W   min  75.397   max  86.394   n=59
+  cores sum mean  14.666 W   min   6.633   max  36.979
+  package - cores   64.015 W   (uncore + SoC + NPU; NOT an NPU figure on its own)
+### phase D: NPU xint8 (fresh compile first, untimed)
+streams=1  fps_samples=[68.3, 69.3]  fps_mean=68.8
+streams=1  fps_mean_steady=69.3  (first sample dropped, n=1)
+done.
+=== D_npu_int8 ===
+  package   mean  36.993 W   min  30.957   max  53.331   n=59
+  cores sum mean   9.592 W   min   3.266   max  25.521
+  package - cores   27.401 W   (uncore + SoC + NPU; NOT an NPU figure on its own)
+### phase E: CPU on the SAME xint8 artifact (dtype control)
+=== E_cpu_int8 ===
+  package   mean  64.927 W   min  59.872   max  74.062   n=59
+  cores sum mean  42.683 W   min  39.728   max  53.102
+  package - cores   22.244 W   (uncore + SoC + NPU; NOT an NPU figure on its own)
+### phase F: idle again (drift control)
+=== F_idle_again ===
+  package   mean  35.212 W   min  16.531   max  64.777   n=59
+  cores sum mean  18.182 W   min   2.436   max  43.772
+  package - cores   17.030 W   (uncore + SoC + NPU; NOT an NPU figure on its own)
+
+--- device after ---
+-----------------------------
+AIE Partitions
+  No hardware contexts running on device
+
+=== power phases end 2026-09-10 09:01:09 ===
+
+--- settling 15 s before throughput pass ---
+
+=== CLEAN THROUGHPUT PASS (separate from power phases, settle gaps between arms) ===
+
+--- B CPU fp32 ---
+streams=1  fps_samples=[0.0, 21.0, 21.0, 20.0, 20.3, 21.0, 20.7, 21.0, 20.7, 21.0, 20.7, 21.3, 20.0]  fps_mean=19.1
+streams=1  fps_mean_steady=20.7  (first sample dropped, n=12)
+
+--- C DML fp32 ---
+streams=1  fps_samples=[0.0, 79.3, 79.0, 79.0, 79.6, 79.3, 79.7, 79.3, 79.3, 79.3, 79.7, 79.3, 79.0]  fps_mean=73.2
+streams=1  fps_mean_steady=79.3  (first sample dropped, n=12)
+
+--- E CPU int8 ---
+streams=1  fps_samples=[0.0, 11.3, 11.3, 11.7, 11.7, 11.3, 11.7, 11.3, 11.7, 11.3, 11.7, 11.3, 11.7]  fps_mean=10.6
+streams=1  fps_mean_steady=11.5  (first sample dropped, n=12)
+
+--- D NPU int8 ---
+streams=1  fps_samples=[68.1, 74.9, 74.9, 74.9, 74.9, 75.3, 75.2, 75.6, 75.5, 75.3, 76.6, 75.6, 72.7]  fps_mean=74.6
+streams=1  fps_mean_steady=75.1  (first sample dropped, n=12)
+
+--- device final ---
+-----------------------------
+AIE Partitions
+  No hardware contexts running on device
+
+=== all done 2026-09-10 09:04:39 ===
+
+--- raw phase JSON ---
+{"package": {"mean_mw": 21366.180421277935, "median_mw": 18846.197106520936, "min_mw": 15345.622800433955, "max_mw": 39900.35092882038, "n": 59}, "core_sum": {"mean_mw": 6078.11060531693, "median_mw": 3514.448535569903, "min_mw": 2425.1118893133203, "max_mw": 28466.06939710228, "n": 59}, "per_core": {"core0": {"mean_mw": 671.903195955465, "median_mw": 512.8792960721626, "min_mw": 235.89045118520926, "max_mw": 3809.0599298326338, "n": 59}, "core1": {"mean_mw": 1256.837883493494, "median_mw": 325.90370717704036, "min_mw": 168.1402812582081, "max_mw": 18830.3288790517, "n": 59}, "core2": {"mean_mw": 678.5545325253622, "median_mw": 405.5465768678161, "min_mw": 234.01863068366754, "max_mw": 4223.922119409957, "n": 59}, "core3": {"mean_mw": 1269.9760202802584, "median_mw": 912.3426297211437, "min_mw": 535.2961390030056, "max_mw": 5181.333497436045, "n": 59}, "core4": {"mean_mw": 245.41479641876128, "median_mw": 111.4155023405271, "min_mw": 38.05262877895842, "max_mw": 2057.1148383664463, "n": 59}, "core5": {"mean_mw": 1325.1241509312454, "median_mw": 924.6697788889757, "min_mw": 628.1263289311286, "max_mw": 5380.076611830994, "n": 59}, "core6": {"mean_mw": 355.4047007749452, "median_mw": 192.289305102572, "min_mw": 94.93096743860492, "max_mw": 3029.9490141807005, "n": 59}, "core7": {"mean_mw": 274.89532493739813, "median_mw": 139.77978335582796, "min_mw": 53.62836733180555, "max_mw": 2461.556157844413, "n": 59}}, "label": "A_idle", "wall_s": 60.969754695892334, "command": null, "sampled_s": 60.0, "interval_s": 1.0}
+{"package": {"mean_mw": 77545.0697708902, "median_mw": 77936.8452596265, "min_mw": 72927.31415138958, "max_mw": 80429.48037422723, "n": 59}, "core_sum": {"mean_mw": 52862.34707700547, "median_mw": 53024.11842440939, "min_mw": 48618.84473752918, "max_mw": 59789.99524437837, "n": 59}, "per_core": {"core0": {"mean_mw": 6783.16799513958, "median_mw": 6798.1349997691095, "min_mw": 6054.044323969462, "max_mw": 7755.9992541274005, "n": 59}, "core1": {"mean_mw": 4141.122376818635, "median_mw": 4232.5928481166375, "min_mw": 2469.0487092388894, "max_mw": 5148.872647802589, "n": 59}, "core2": {"mean_mw": 7181.109343740698, "median_mw": 7108.111276080332, "min_mw": 6720.581464967039, "max_mw": 8795.512706683066, "n": 59}, "core3": {"mean_mw": 8002.313260174099, "median_mw": 7984.367740808974, "min_mw": 7287.909217650339, "max_mw": 9436.864248574604, "n": 59}, "core4": {"mean_mw": 5869.077043303396, "median_mw": 5871.595231842604, "min_mw": 5256.647234466089, "max_mw": 6580.350039777248, "n": 59}, "core5": {"mean_mw": 8029.692115510384, "median_mw": 7954.921135668957, "min_mw": 7611.906167813462, "max_mw": 9246.790047046674, "n": 59}, "core6": {"mean_mw": 6502.006206334706, "median_mw": 6530.704261465979, "min_mw": 5768.672396317256, "max_mw": 6990.83648637623, "n": 59}, "core7": {"mean_mw": 6353.858735983972, "median_mw": 6443.36956228526, "min_mw": 5645.432658602384, "max_mw": 6810.404195581925, "n": 59}}, "label": "B_cpu_fp32", "wall_s": 61.81126856803894, "command": "python tools/session_hold.py --model models/bisenetv2_fp32.onnx --cache-key bisenetv2cachekey --ep cpu --streams 1 --hold 95", "sampled_s": 60.0, "interval_s": 1.0}
+{"package": {"mean_mw": 78681.82401458464, "median_mw": 76283.36679912043, "min_mw": 75397.20698910528, "max_mw": 86393.82065198386, "n": 59}, "core_sum": {"mean_mw": 14666.487329462883, "median_mw": 7942.020844765855, "min_mw": 6632.585285956055, "max_mw": 36979.408874781104, "n": 59}, "per_core": {"core0": {"mean_mw": 1582.6671959434855, "median_mw": 672.1786759178545, "min_mw": 428.894191902044, "max_mw": 4682.858569774175, "n": 59}, "core1": {"mean_mw": 1211.7229440384642, "median_mw": 736.7743902006791, "min_mw": 216.237658674189, "max_mw": 3497.514044874354, "n": 59}, "core2": {"mean_mw": 1692.45818583557, "median_mw": 681.8987817595084, "min_mw": 434.98539315552927, "max_mw": 5139.111857760856, "n": 59}, "core3": {"mean_mw": 3258.9087921230835, "median_mw": 2890.162620871154, "min_mw": 1213.5899394725006, "max_mw": 6104.090220269183, "n": 59}, "core4": {"mean_mw": 1012.6990182363663, "median_mw": 156.11011586499944, "min_mw": 75.67325358582016, "max_mw": 4176.40818919972, "n": 59}, "core5": {"mean_mw": 3584.3001343644287, "median_mw": 3264.4900674887813, "min_mw": 1392.8343031135048, "max_mw": 6565.175824294464, "n": 59}, "core6": {"mean_mw": 1216.6324214948581, "median_mw": 283.25204167343105, "min_mw": 151.59280315038288, "max_mw": 4385.438026000566, "n": 59}, "core7": {"mean_mw": 1107.0986374266272, "median_mw": 193.70867342804905, "min_mw": 115.85815580353369, "max_mw": 4372.197375920998, "n": 59}}, "label": "C_dml_fp32", "wall_s": 61.749462842941284, "command": "python tools/session_hold.py --model models/bisenetv2_fp32.onnx --cache-key bisenetv2cachekey --ep dml --streams 1 --hold 95", "sampled_s": 60.0, "interval_s": 1.0}
+{"package": {"mean_mw": 36992.97268911368, "median_mw": 34557.00096465999, "min_mw": 30957.252626861926, "max_mw": 53331.12657752191, "n": 59}, "core_sum": {"mean_mw": 9592.12566459337, "median_mw": 7021.127231403919, "min_mw": 3266.134313086347, "max_mw": 25521.030626171898, "n": 59}, "per_core": {"core0": {"mean_mw": 1200.9443300771984, "median_mw": 941.9390941812275, "min_mw": 430.2936935464385, "max_mw": 3331.0999968095175, "n": 59}, "core1": {"mean_mw": 842.7128157268934, "median_mw": 523.2035659081922, "min_mw": 111.54841366017843, "max_mw": 11538.09518929649, "n": 59}, "core2": {"mean_mw": 1305.9001167394765, "median_mw": 861.1915794467767, "min_mw": 420.2612440260212, "max_mw": 3734.98021238114, "n": 59}, "core3": {"mean_mw": 2244.021532063396, "median_mw": 1574.6631115059972, "min_mw": 894.1620524008158, "max_mw": 5555.888992403612, "n": 59}, "core4": {"mean_mw": 370.6883342491663, "median_mw": 243.53601363175832, "min_mw": 52.35372522821842, "max_mw": 2731.8612483782003, "n": 59}, "core5": {"mean_mw": 2562.143433221472, "median_mw": 2079.447855572173, "min_mw": 974.6118856916839, "max_mw": 6067.452100099612, "n": 59}, "core6": {"mean_mw": 633.3274867218436, "median_mw": 422.4618061338389, "min_mw": 117.15121451302612, "max_mw": 2316.341118082881, "n": 59}, "core7": {"mean_mw": 432.38761579392326, "median_mw": 287.27386637381323, "min_mw": 55.4337513369839, "max_mw": 1971.86901668575, "n": 59}}, "label": "D_npu_int8", "wall_s": 61.07209253311157, "command": "python tools/session_hold.py --model models/bisenetv2_fp32_xint8.onnx --cache-key bisenetv2cachekey --ep npu --streams 1 --hold 95", "sampled_s": 60.0, "interval_s": 1.0}
+{"package": {"mean_mw": 64926.69287680437, "median_mw": 63324.887291818784, "min_mw": 59871.799853095414, "max_mw": 74062.21699475966, "n": 59}, "core_sum": {"mean_mw": 42682.61967084672, "median_mw": 42089.77748861422, "min_mw": 39727.544468202206, "max_mw": 53101.56876317644, "n": 59}, "per_core": {"core0": {"mean_mw": 5331.733369691801, "median_mw": 5256.758865425733, "min_mw": 4953.851004848558, "max_mw": 6474.515536697983, "n": 59}, "core1": {"mean_mw": 3436.1704451937912, "median_mw": 3289.6725754364, "min_mw": 2652.394975039576, "max_mw": 7184.726650008616, "n": 59}, "core2": {"mean_mw": 5630.907027787416, "median_mw": 5478.890458778988, "min_mw": 5018.980293333429, "max_mw": 7179.486719872992, "n": 59}, "core3": {"mean_mw": 6594.303506481318, "median_mw": 6505.314536354379, "min_mw": 5879.6779260772955, "max_mw": 8675.260026072696, "n": 59}, "core4": {"mean_mw": 4607.550304419103, "median_mw": 4569.998697091595, "min_mw": 3719.035826996164, "max_mw": 5706.192858194257, "n": 59}, "core5": {"mean_mw": 6751.152556931175, "median_mw": 6768.169978693182, "min_mw": 5864.351764731078, "max_mw": 8551.137058640563, "n": 59}, "core6": {"mean_mw": 5224.033523042508, "median_mw": 5176.036881819546, "min_mw": 4803.211313811905, "max_mw": 6121.0200539597345, "n": 59}, "core7": {"mean_mw": 5106.768937299604, "median_mw": 5110.732565901602, "min_mw": 4683.065067451242, "max_mw": 6166.47318647715, "n": 59}}, "label": "E_cpu_int8", "wall_s": 61.424399614334106, "command": "python tools/session_hold.py --model models/bisenetv2_fp32_xint8.onnx --cache-key bisenetv2cachekey --ep cpu --streams 1 --hold 95", "sampled_s": 60.0, "interval_s": 1.0}
+{"package": {"mean_mw": 35211.59502505206, "median_mw": 26610.062939422107, "min_mw": 16530.852590677267, "max_mw": 64776.75064205768, "n": 59}, "core_sum": {"mean_mw": 18181.933916250953, "median_mw": 9694.449648286107, "min_mw": 2435.704504209487, "max_mw": 43771.779251137326, "n": 59}, "per_core": {"core0": {"mean_mw": 2083.927421106266, "median_mw": 962.8162878720821, "min_mw": 160.32022683637916, "max_mw": 5981.038531790902, "n": 59}, "core1": {"mean_mw": 1574.902695415714, "median_mw": 1017.8123814487451, "min_mw": 174.97107694071042, "max_mw": 3888.042058084207, "n": 59}, "core2": {"mean_mw": 2347.1082576177055, "median_mw": 1588.9418723559995, "min_mw": 188.53870033038822, "max_mw": 5883.756399235573, "n": 59}, "core3": {"mean_mw": 3812.3165085372475, "median_mw": 2421.3793176498, "min_mw": 441.0057497691894, "max_mw": 12760.686465321987, "n": 59}, "core4": {"mean_mw": 1529.1501777960536, "median_mw": 358.8166397617573, "min_mw": 62.294711804996695, "max_mw": 4889.135996116131, "n": 59}, "core5": {"mean_mw": 3330.4870883680815, "median_mw": 2682.334324897357, "min_mw": 592.5840782401665, "max_mw": 9877.629233511587, "n": 59}, "core6": {"mean_mw": 1852.743026549076, "median_mw": 607.0912244475089, "min_mw": 118.60087977691371, "max_mw": 5351.0869953236, "n": 59}, "core7": {"mean_mw": 1651.2987408608092, "median_mw": 344.30009430188034, "min_mw": 55.93816947752265, "max_mw": 5229.925728928059, "n": 59}}, "label": "F_idle_again", "wall_s": 61.556923627853394, "command": null, "sampled_s": 60.0, "interval_s": 1.0}

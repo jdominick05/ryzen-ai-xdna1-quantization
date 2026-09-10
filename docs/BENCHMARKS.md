@@ -1690,6 +1690,52 @@ memory + NPU); no accuracy axis, so this compares energy at fixed *work*, not fi
 accuracy; and idle is not free — the machine burns ~41.5 W doing nothing, which is why the
 marginal and total columns differ so much and why a battery platform would look different.
 
+### A second model, chosen to be adversarial to the finding: the energy edge survives where the speed edge nearly vanishes
+
+ResNet50 is a case the NPU already wins on latency (2.80× CPU, 1.34× iGPU), so it leaves
+open whether the energy edge merely rides a speed edge. BiSeNetV2 is the adversarial test:
+`docs/BENCHMARKS.md`'s own Category B result puts the NPU only 1.09× ahead of the iGPU on
+latency, the closest race in this repo. `results/aie/power_rapl_bisenetv2_joules_per_frame.log`,
+2026-09-10, six power phases plus a throughput pass fully separated from them (the fix for
+the contamination the ResNet50 log found and retracted).
+
+**This sitting's idle baseline disagreed by 41% between its two idle phases** (18.8 vs
+26.6 W median), against the ResNet50 sitting's 0.8% — active workload phases stayed tight
+(7.5–22.4 W spread) while the idle phases alone were wide (24.6 and 48.3 W spread),
+consistent with background OS activity being a large perturbation against a near-zero true
+idle and a small one against a busy package. Rather than assert one baseline, every figure
+below is reported across the full low/mean/high sensitivity range that spans it.
+
+| arm | J/frame @idle_lo | @idle_mean | @idle_hi | fps |
+|---|---|---|---|---|
+| CPU fp32 | 2.8546 | 2.6671 | 2.4796 | 20.7 |
+| iGPU (DML) fp32 | 0.7243 | 0.6754 | 0.6264 | 79.3 |
+| **NPU xint8** | **0.2092** | **0.1575** | **0.1058** | 75.1 |
+| CPU xint8 *(control)* | 3.8677 | 3.5302 | 3.1926 | 11.5 |
+
+**Across the entire sensitivity range the ranking never changes**: NPU vs CPU is 13.65–
+23.43×, NPU vs iGPU is 3.46–5.92×. The exact multiple carries ~1.7× uncertainty from the
+idle noise; the order of magnitude and the ranking do not.
+
+**The sharpest point this sitting makes:** the clean throughput pass reads NPU 75.1 fps
+against iGPU 79.3 fps — the iGPU is 1.056× *faster* here, the opposite direction from the
+docs' recorded 1.086× NPU-over-DML for the same model. Both are close enough to 1.0 to be
+a coin flip across sittings (consistent with this file's own note that NPU/DML latency
+drifts session to session), not a claimed regression. **The energy result carries no such
+ambiguity at any point in the range: the NPU is 3.46–5.92× more efficient than the iGPU
+regardless of which sitting's latency number is believed.** This is the clearest evidence
+here that the energy advantage does not merely ride a speed advantage.
+
+**The dtype control reproduces on a second, structurally different model.** CPU on the
+same XINT8 artifact is again slower than CPU FP32 (11.5 vs 20.7 fps) and less
+energy-efficient at every baseline (3.53 vs 2.67 J/frame at the mean) — ORT's QDQ int8
+path costs this CPU both throughput and energy on segmentation as well as classification.
+
+**What does not carry over:** the ResNet50 log's clean core-vs-residual attribution
+(iGPU cores below idle, NPU cores flat) does not hold here — the idle core median itself
+spans 3.5–9.7 W, overlapping both the NPU (7.0 W) and iGPU (7.9 W) phases, so no confident
+attribution is drawn from this sitting alone; the package-level ranking is unaffected.
+
 ### The AIE core clock, measured: 1.80 GHz default, 0.80 powersaver
 
 Every per-second ceiling this repo derives for the array — TOPS per column, bytes per
