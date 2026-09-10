@@ -189,10 +189,10 @@ Outcomes, mostly negative and all measured:
   missing 16 KB too: **2700 GFLOPS** at 2048×4096×4096, **1.89×** same-sitting CPU bf16; int8 gains 13%.
 - **Int8 conv loses, and the op class is closed** — still, after a **3×** fix (register-resident
   accumulators, 116 → 350 GOPS): CPU wins **2.4×** on marginal rate, **12.75×** at 56×56.
-- **bf16 attention for MobileViT loses by 71×–240×**, and its recorded diagnosis was
-  wrong: not dispatch cost, but `attention_kernels.cc` never calling `aie::mmul` — 0.61 GFLOPS vs 895.
+- **bf16 attention for MobileViT loses 71×–240×** — not dispatch cost, as first recorded, but `attention_kernels.cc` never calling `aie::mmul`: 0.61 GFLOPS vs 895.
 - **A bf16 GroupNorm beat the CPU on 33 of 49 nodes** of `resnetv2_50x3_bit` — and then
   the measured two-process handoff floor (789 µs–23.6 ms per call) erased all 33.
+- **bf16 activations (ReLU/SiLU/GELU) are accurate but never worth dispatching** — **0.77×** at best.
 - **Go/no-go:** CPU time must exceed a *host-set* dispatch floor — **617 µs** one-shot IRON,
   **~531 µs** batched IRON, **36.7 µs** batched C++ (≈ pyxrt: it's the driver's). **1.80 GHz**.
 
