@@ -117,8 +117,22 @@ and a clean re-run returned **198.2 fps with near-zero variance** (samples 197.7
 across 12 intervals). The other three were then re-taken the same way, each on an
 otherwise-idle host with an 8 s settle between arms; all four are stable to under 1%.
 
-**The POWER phases are NOT affected** and are not retracted: each ran exactly one workload
-under the probe, which is the condition the throughput runs violated.
+**The POWER phases are not retracted, but "each ran exactly one workload" was never
+actually true (added 2026-09-10).** `power_probe.py` ended its `--command` workload with
+`proc.terminate()`, which on Windows kills only the `cmd.exe` wrapper `shell=True`
+creates, not the workload underneath it -- confirmed directly while investigating the
+same tool's contamination of `power_rapl_bisenetv2_joules_per_frame.log`'s power phases.
+Here each phase's inline throughput check (this section) ran immediately after that
+phase's own probe and itself held the provider for ~25 s -- long enough to occupy most of
+the orphaned workload's remaining ~32 s lifetime before the NEXT phase's probe started, so
+this study's power phases were shielded from the bug mostly by that lucky sequencing, not
+by isolation. The residual bleed this leaves (a few seconds at most into the next phase)
+is far smaller than what BiSeNetV2's fully-separated design exposed, and is consistent
+with `phase F`'s own outlier max (74.0 W, matching phase E's load) rather than solely the
+peer process blamed above -- both may have contributed. Fixed in `tools/power_probe.py`
+(tree-kill via `taskkill /F /T`); no re-measurement of this log was judged necessary given
+the small bound on the residual and that medians (not means) already carry this study's
+headline numbers.
 
 CONTENTION
 ==========

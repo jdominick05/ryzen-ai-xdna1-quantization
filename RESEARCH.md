@@ -84,12 +84,19 @@ generalize beyond any one model:
    (2026-09-10):** BiSeNetV2 is where this repo's own docs record the NPU's *latency* lead
    over the iGPU as narrowest (1.09×), so it is the sharpest available test of whether the
    energy edge is just riding a speed edge. It isn't: that sitting's own clean throughput
-   pass actually put the iGPU 1.056× *faster* than the NPU — a coin-flip reversal of the
+   pass actually put the iGPU 1.057× *faster* than the NPU — a coin-flip reversal of the
    docs' figure, consistent with known session-to-session latency drift, not a regression
-   — while the energy ranking never wavered across a full baseline-uncertainty sensitivity
-   range (that sitting's idle phases disagreed by 41%, handled by reporting a range rather
-   than a point estimate): **NPU 3.46–5.92× more efficient than the iGPU regardless of
-   which sitting's latency number is believed.** The dtype control reproduced too.
+   — while the energy ranking never wavered: **NPU 5.0× more efficient than the iGPU,
+   18.6× the CPU.** The dtype control reproduced too. This measurement's first pass
+   reported a 3.46–5.92× sensitivity range instead, built on the assumption a 41%
+   idle-to-idle disagreement was ambient noise; **that range is retracted.** The real
+   cause was a `tools/power_probe.py` bug — `proc.terminate()` doesn't kill a `shell=True`
+   child on Windows, so one phase's workload could bleed into the next — fixed, and a
+   clean re-measurement still needed one idle phase excluded on a physical-impossibility
+   check (an active NPU phase read below it) rather than converging outright, so idle-floor
+   instability on this host is real and only partly explained. See
+   `results/aie/power_rapl_bisenetv2_joules_per_frame_v2.log` and `docs/DECISIONS.md` for
+   the mechanism.
    The instrument arrived late and by accident: AMD's RAPL counters turn out to be
    published through Windows' PDH (`\Energy Meter(RAPL_Package0_PKG)\Power`), needing no
    driver, no elevation and no hardware context, after the route `docs/SILICON.md` S4
@@ -97,9 +104,9 @@ generalize beyond any one model:
    machine. What is *not* established: batch 1 only (ResNet50 INT8 is the NPU's best case),
    60-second windows rather than sustained thermal steady state, throughput and power
    captured in different windows, and an NPU figure that is a residual (package minus
-   cores) and so an upper bound rather than an isolate — and that residual attribution,
-   clean on ResNet50, did not transfer to the BiSeNetV2 sitting, whose noisier idle floor
-   left its core numbers overlapping across providers. See
+   cores) and so an upper bound rather than an isolate — the BiSeNetV2 re-measurement
+   found the same core-vs-residual signature ResNet50 did once the correct idle baseline
+   was used, but on one 60 s window rather than ResNet50's multi-sitting agreement. See
    [joules per frame](docs/BENCHMARKS.md#joules-per-frame-the-npu-does-113-the-inferences-per-joule-of-the-cpu-59-the-igpu)
    and [the first watt](docs/BENCHMARKS.md#the-first-watt-the-npu-is-133-faster-and-445-cheaper-on-the-same-gemm).
 

@@ -135,11 +135,20 @@ def main():
     wall = time.time() - t0
 
     if proc is not None:
-        proc.terminate()
+        # proc.terminate() is NOT enough here: shell=True on Windows makes proc a cmd.exe
+        # wrapper, and TerminateProcess on it does not touch its child (the actual
+        # workload). That child was measured surviving 20+ seconds past this function
+        # returning, bleeding into the NEXT phase's sampling window -- this is what
+        # silently contaminated four throughput readings in the ResNet50 study and,
+        # worse, contaminated the BiSeNetV2 study's own POWER phases themselves (retracted
+        # in results/aie/power_rapl_bisenetv2_joules_per_frame.log). `taskkill /T` kills
+        # the whole process tree, not just the tracked PID.
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                        capture_output=True)
         try:
             proc.wait(timeout=15)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            pass
 
     s = summarize(series)
     s.update(label=args.label, wall_s=wall, command=args.command,

@@ -1699,42 +1699,52 @@ latency, the closest race in this repo. `results/aie/power_rapl_bisenetv2_joules
 2026-09-10, six power phases plus a throughput pass fully separated from them (the fix for
 the contamination the ResNet50 log found and retracted).
 
-**This sitting's idle baseline disagreed by 41% between its two idle phases** (18.8 vs
-26.6 W median), against the ResNet50 sitting's 0.8% — active workload phases stayed tight
-(7.5–22.4 W spread) while the idle phases alone were wide (24.6 and 48.3 W spread),
-consistent with background OS activity being a large perturbation against a near-zero true
-idle and a small one against a busy package. Rather than assert one baseline, every figure
-below is reported across the full low/mean/high sensitivity range that spans it.
+**This sitting's first pass reported a 41% idle-baseline disagreement** (18.8 vs 26.6 W
+median) and a low/mean/high sensitivity range built on the assumption both idle phases
+were equally valid endpoints of ambient noise. **That range is retracted.** Investigating
+it found a real bug: `tools/power_probe.py` ended its `--command` workload with
+`proc.terminate()`, which on Windows kills only the `cmd.exe` wrapper `shell=True`
+creates, not the workload underneath — leaving up to ~32 s of the previous phase's
+workload still running into the next phase's sampling window. F's package max (64.8 W)
+matches E's own median almost exactly, which is what the contaminated range was actually
+bracketing: one contaminated reading, not two independently noisy ones. Fixed
+(`taskkill /F /T`) and re-measured
+(`results/aie/power_rapl_bisenetv2_joules_per_frame_v2.log`). The re-measurement did not
+simply converge — its own idle phase A picked up a separate, independently diagnosed
+contamination (most likely a `git fetch` run on the measurement host mid-phase) — but that
+one is excluded outright rather than ranged against, on a physical-impossibility check: an
+active NPU phase read *below* it, which a true idle baseline cannot. F is used as the sole
+baseline below.
 
-| arm | J/frame @idle_lo | @idle_mean | @idle_hi | fps |
-|---|---|---|---|---|
-| CPU fp32 | 2.8546 | 2.6671 | 2.4796 | 20.7 |
-| iGPU (DML) fp32 | 0.7243 | 0.6754 | 0.6264 | 79.3 |
-| **NPU xint8** | **0.2092** | **0.1575** | **0.1058** | 75.1 |
-| CPU xint8 *(control)* | 3.8677 | 3.5302 | 3.1926 | 11.5 |
+| arm | J/frame | fps |
+|---|---|---|
+| CPU fp32 | 2.646 | 21.4 |
+| iGPU (DML) fp32 | 0.710 | 81.1 |
+| **NPU xint8** | **0.142** | 76.7 |
+| CPU xint8 *(control)* | 3.926 | 11.4 |
 
-**Across the entire sensitivity range the ranking never changes**: NPU vs CPU is 13.65–
-23.43×, NPU vs iGPU is 3.46–5.92×. The exact multiple carries ~1.7× uncertainty from the
-idle noise; the order of magnitude and the ranking do not.
+**NPU vs CPU is 18.6×, NPU vs iGPU is 5.0×** (marginal power over the validated idle
+baseline, medians).
 
-**The sharpest point this sitting makes:** the clean throughput pass reads NPU 75.1 fps
-against iGPU 79.3 fps — the iGPU is 1.056× *faster* here, the opposite direction from the
-docs' recorded 1.086× NPU-over-DML for the same model. Both are close enough to 1.0 to be
-a coin flip across sittings (consistent with this file's own note that NPU/DML latency
-drifts session to session), not a claimed regression. **The energy result carries no such
-ambiguity at any point in the range: the NPU is 3.46–5.92× more efficient than the iGPU
-regardless of which sitting's latency number is believed.** This is the clearest evidence
-here that the energy advantage does not merely ride a speed advantage.
+**The sharpest point this sitting makes:** the clean throughput pass reads NPU 76.7 fps
+against iGPU 81.1 fps — the iGPU is 1.057× *faster* here, essentially the same margin and
+direction as the first (retracted-range) sitting's 1.056×, and still the opposite
+direction from the docs' recorded 1.086× NPU-over-DML for the same model. Whatever drives
+that reversal is stable across two sittings on this host, not a one-off. **The energy
+result carries no such ambiguity: the NPU is 5.0× more efficient than the iGPU regardless
+of which sitting's latency number is believed.** This is the clearest evidence here that
+the energy advantage does not merely ride a speed advantage.
 
 **The dtype control reproduces on a second, structurally different model.** CPU on the
-same XINT8 artifact is again slower than CPU FP32 (11.5 vs 20.7 fps) and less
-energy-efficient at every baseline (3.53 vs 2.67 J/frame at the mean) — ORT's QDQ int8
-path costs this CPU both throughput and energy on segmentation as well as classification.
+same XINT8 artifact is again slower than CPU FP32 (11.4 vs 21.4 fps) and 1.48× less
+energy-efficient (3.926 vs 2.646 J/frame) — ORT's QDQ int8 path costs this CPU both
+throughput and energy on segmentation as well as classification.
 
-**What does not carry over:** the ResNet50 log's clean core-vs-residual attribution
-(iGPU cores below idle, NPU cores flat) does not hold here — the idle core median itself
-spans 3.5–9.7 W, overlapping both the NPU (7.0 W) and iGPU (7.9 W) phases, so no confident
-attribution is drawn from this sitting alone; the package-level ranking is unaffected.
+**On attribution:** once the correct idle baseline is used, cores stay close to idle on
+both the iGPU (+5.3 W) and NPU (+1.1 W) phases while the residual carries the rest (iGPU
++52.3 W, NPU +9.8 W) — the same qualitative signature the ResNet50 log found, visible here
+after all. Treated as one supporting data point, not a second confirmed instance: it rests
+on a single 60 s window per phase, not ResNet50's multi-sitting agreement.
 
 ### The AIE core clock, measured: 1.80 GHz default, 0.80 powersaver
 

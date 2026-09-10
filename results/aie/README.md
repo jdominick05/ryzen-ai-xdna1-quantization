@@ -675,24 +675,37 @@ peer burst put phase F's *mean* 8% above phase A's while the medians agree to 0.
 `power_probe.py` terminates its workload when sampling ends and the next run started before
 the 95 s hold exited, so two sessions shared one provider. Caught by the NPU's 90.6 fps
 contradicting this repo's documented 5.27 ms latency; re-measured clean at 198.2 fps
-(197.7–198.7 across 12 intervals). The **power phases are unaffected** — each ran exactly
-one workload. Written up in
+(197.7–198.7 across 12 intervals). **The power phases carry a small, bounded residual
+of the same bug** (added 2026-09-10, see the log's own footnote): the terminated
+workload's process tree survives on Windows and can bleed into the next phase, but this
+study's inline throughput checks happened to absorb most of each workload's remaining
+lifetime before the next phase started, unlike BiSeNetV2's fully-separated design where
+the same bug contaminated a whole idle phase. Written up in
 [`docs/BENCHMARKS.md`](../../docs/BENCHMARKS.md#joules-per-frame-the-npu-does-113-the-inferences-per-joule-of-the-cpu-59-the-igpu).
 
 **`power_rapl_bisenetv2_joules_per_frame.log`** — a second model family, chosen to be
 adversarial: BiSeNetV2 is where the NPU's documented latency lead over the iGPU is
-narrowest (1.09×). The energy finding survives: **NPU 3.46–5.92× more efficient than the
-iGPU, 13.65–23.43× more than the CPU**, reported as a sensitivity range rather than a point
-estimate because this sitting's two idle phases disagreed by 41% (active workload phases
-stayed tight, 7.5–22.4 W spread; idle alone spread 24.6 and 48.3 W — consistent with
-background OS activity mattering more against a near-zero true idle). **The sharpest
-result: this session's clean throughput reads the iGPU 1.056× *faster* than the NPU**, the
-opposite direction from the docs' 1.086× NPU-over-DML, both close enough to 1.0 to be a
-coin-flip across sittings — yet the energy ranking never wavers across the full baseline
-range. The dtype control reproduces on this structurally different model (CPU-int8 slower
-AND less efficient than CPU-fp32). What does *not* carry over from the ResNet50 log: its
-clean core-vs-residual attribution — here the idle core median (3.5–9.7 W) overlaps both
-the NPU and iGPU phases, so no attribution is drawn from this sitting alone. Written up in
+narrowest (1.09×). **Superseded by its own `_v2` log for the headline numbers; kept for
+its `CORRECTION` appendix's evidence.** Originally reported a 3.46–5.92× sensitivity range
+across a 41%-disagreeing idle baseline, attributed to ambient OS noise. That attribution
+was wrong: `tools/power_probe.py`'s `proc.terminate()` doesn't kill a `shell=True`
+workload's child process on Windows, so one phase's workload could bleed into the next's
+sampling window — see `docs/DECISIONS.md`.
+
+**`power_rapl_bisenetv2_joules_per_frame_v2.log`** — the corrected re-measurement, run
+after fixing `power_probe.py` (tree-kill via `taskkill /F /T`). Re-running did not simply
+converge the idle phases — the new sitting's own phase A picked up a separate,
+independently diagnosed contamination (most likely a `git fetch` run on the host
+mid-phase) — but that one is excluded outright on a physical-impossibility check (an
+active NPU phase read below it), not ranged against. **NPU 5.0× more efficient than the
+iGPU, 18.6× more than the CPU** (point estimate, medians, validated baseline). **The
+sharpest result holds:** this session's clean throughput reads the iGPU 1.057× *faster*
+than the NPU, the opposite direction from the docs' 1.086× NPU-over-DML and nearly
+identical to the first sitting's 1.056× — yet the energy ranking is unambiguous either
+way. The dtype control reproduces (CPU-int8 1.48× worse than CPU-fp32). Unlike the first
+sitting, a clean core-vs-residual attribution *does* emerge once the correct baseline is
+used (cores near-idle on both iGPU and NPU phases, residual carrying the rest) — one
+supporting data point, not yet a second confirmed instance. Written up in
 [`docs/BENCHMARKS.md`](../../docs/BENCHMARKS.md#a-second-model-chosen-to-be-adversarial-to-the-finding-the-energy-edge-survives-where-the-speed-edge-nearly-vanishes).
 
 **`power_rapl_bf16_gemm_npu_vs_cpu.log`** — the first watt measured in this repo, and it

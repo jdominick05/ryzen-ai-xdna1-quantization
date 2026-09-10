@@ -563,15 +563,22 @@ takes +47.09 W, placing the 780M in the SoC domain, and the NPU takes +8.96 W re
 **Confirmed on a second, adversarial model the next day:** BiSeNetV2, where the NPU's
 *latency* lead over the iGPU is documented as narrowest (1.09×) — the sharpest available
 test of whether the energy edge merely rides a speed edge. That sitting's own clean
-throughput actually put the iGPU 1.056× *faster* (a coin-flip reversal consistent with
-known session-to-session drift, not a regression), yet the NPU still ran **3.46–5.92×**
-more efficiently across a full sensitivity range needed because that sitting's idle phases
-disagreed 41% (active workload phases stayed tight). `results/aie/power_rapl_bisenetv2_joules_per_frame.log`.
+throughput actually put the iGPU 1.057× *faster* (a coin-flip reversal consistent with
+known session-to-session drift, not a regression), yet the NPU still ran **5.0×** more
+efficiently than the iGPU (18.6× the CPU). The first pass at this measurement reported a
+low/mean/high sensitivity range instead of a point estimate, attributing a 41% idle-to-idle
+disagreement to ambient noise; that was wrong and retracted — the real cause was a
+`power_probe.py` bug (`.terminate()` doesn't kill a `shell=True` child on Windows) that let
+one phase's workload bleed into the next, since fixed. A clean re-measurement
+(`_v2`) still needed an idle phase excluded on a physical-impossibility check rather than
+simply converging, so idle-floor instability on this host is real and ongoing, not fully
+resolved by the fix alone. `results/aie/power_rapl_bisenetv2_joules_per_frame_v2.log`
+(supersedes the non-`_v2` log's headline numbers; that log's `CORRECTION` appendix and
+`docs/DECISIONS.md` carry the mechanism).
 Still open: batch 1 only, 60 s windows rather than sustained thermal steady state,
 throughput and power captured in separate windows, a residual that is an upper bound
-rather than an isolate (uncore + SoC + NPU + memory controller), and — new from the
-BiSeNetV2 sitting — the core-vs-residual attribution that worked cleanly on ResNet50 does
-not transfer when the idle floor itself is this noisy.
+rather than an isolate (uncore + SoC + NPU + memory controller), and no tool calls should
+run on the measurement host during a power phase (a lesson this correction cost).
 `results/aie/power_rapl_bf16_gemm_npu_vs_cpu.log`,
 [BENCHMARKS](BENCHMARKS.md#the-first-watt-the-npu-is-133-faster-and-445-cheaper-on-the-same-gemm).
 Original entry, kept because its reasoning is what made the measurement designable:

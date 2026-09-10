@@ -813,6 +813,37 @@
   inter-branch activation scales attenuates minority classes (15.33% pixel accuracy, 2.44% mIoU), confirming that
   multi-branch bilateral gating requires fine-tuning or AdaRound to balance inter-branch scale multipliers on physical systolic hardware.
 
+- **`subprocess.Popen(cmd, shell=True)` on Windows survives `.terminate()` — the tracked
+  PID is a `cmd.exe` wrapper, not the workload, and `TerminateProcess` does not touch
+  children.** `tools/power_probe.py` used `proc.terminate()` / `proc.kill()` to end its
+  `--command` workload when sampling finished. Empirically confirmed on 2026-09-10: a 5 s
+  probe against a 60 s hold left the workload's `python.exe` (and its `cmd.exe` parent)
+  both still running, unkilled, well past the tool's own 15 s `wait()` timeout. The
+  surviving workload bled into the SETTLE gap and the START of the next phase's sampling
+  window — silently contaminating both a throughput reading (already caught and retracted
+  in `results/aie/power_rapl_resnet50_joules_per_frame.log`) and, very likely, the **power
+  phases themselves** in `results/aie/power_rapl_bisenetv2_joules_per_frame.log`, whose
+  41% idle-baseline disagreement was diagnosed as ambient OS noise when the timing and
+  magnitude instead point at phase E's orphaned hold still running through part of phase
+  F (F's package max, 64.8 W, matches E's own median almost exactly) — stated as "very
+  likely" because it cannot be proven after the fact which samples were contaminated.
+  Re-running with the fix did NOT simply converge the idle phases: the re-measurement's
+  own phase A picked up a separate, independently diagnosed ~11 W two-core contamination
+  (most likely this session's own `git fetch` running on the measurement host mid-phase),
+  ruled invalid by a physical-impossibility check (an active NPU phase read *below* it) —
+  so this bug was real and fixed, but was not the sole source of idle instability on this
+  host; see `power_rapl_bisenetv2_joules_per_frame_v2.log`. The ResNet50 study's power
+  phases were shielded from the same bug mostly by luck: its (also-flawed) inline
+  throughput checks happened to occupy the ~30 s window where the orphan was still alive,
+  absorbing most of it before the next phase's probe started — the reasoning "each phase
+  ran exactly one workload" was never actually true, it just mostly didn't matter there
+  (a small residual bleed is noted in that log now too). Fixed by killing the whole
+  process tree (`taskkill /F /T /PID <pid>`) instead of the single tracked PID; verified
+  by re-running the same orphan check and confirming zero surviving `python.exe`/
+  `cmd.exe`. Any future tool that shells out to hold a workload for a fixed duration and
+  then tears it down needs the tree-kill, not `Popen.terminate()` — and no tool call
+  should touch the measurement host while a power phase is sampling, full stop.
+
 ## The YOLOv8 partitioning failure (resolved)
 
 For a while, YOLOv8 would not reach the NPU at all: the VitisAI EP claimed **zero**
