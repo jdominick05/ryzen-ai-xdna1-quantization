@@ -660,6 +660,24 @@ got the same oracle. Patching `whole_array.py` changes its JIT-cache hash, so th
 each config recompiles (seconds). CPU timings were taken beside another session's yolov6n
 evaluation runs. Cited by [`kernels/README.md`](../../kernels/README.md).
 
+**`power_rapl_bf16_gemm_npu_vs_cpu.log`** — the first watt measured in this repo, and it
+moves the headline: on the same bf16 2048³ GEMM the NPU is **1.33× faster and 4.45× more
+energy-efficient** (0.1407 J vs 0.6267 J marginal per GEMM; 122.1 vs 27.4 GFLOPS per
+marginal watt). The route `docs/SILICON.md` S4 proposed does not work and did not need to:
+HWiNFO's shared-memory export is **off** here (`HWiNFO64.INI` has no `SensorsSM` key,
+contrary to the backlog's claim) and HWiNFO runs elevated, but **Windows publishes AMD's
+RAPL counters through PDH** — no driver, no elevation, no hardware context.
+`tools/power_probe.py` samples them; `Power` is milliwatts, MEASURED by controlled burn
+(one thread +9.59 W, sixteen +42.1 W over a 41.3 W idle), while the set's `Energy` column
+resolves to no standard unit and is deliberately unused. Four phases in one sitting with a
+repeat-idle drift control agreeing to 0.5%. **S4's attribution test passes**: during the
+NPU phase cores move +1.34 W while the residual takes +11.63 W, so the draw is inside the
+package and outside the cores. Caveats carried: one shape, the residual is an upper bound
+(uncore + SoC + NPU + memory) not an isolate, the CPU leg is one torch implementation, and
+a peer process held ~1.0 core through all phases (cancels from deltas, biases the total
+column). Written up in
+[`docs/BENCHMARKS.md`](../../docs/BENCHMARKS.md#the-first-watt-the-npu-is-133-faster-and-445-cheaper-on-the-same-gemm).
+
 **`bf16_activation_sweep_npu.log`** — the timing half of a result this repo had only
 half-taken: `mlir_aie_ml_examples_npu.log` recorded ReLU/SiLU/GELU as `PASS!` but never
 timed them. Timed now against Zen 4 torch, 15 rows each in its own process:

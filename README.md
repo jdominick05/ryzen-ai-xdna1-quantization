@@ -9,6 +9,8 @@ reproducible end to end, but the deliverable is measurements: every number below
 backed by a log under [`results/`](results/README.md), and the most useful part of the
 repo is probably the set of XDNA1 facts that are undocumented or documented incorrectly.
 
+> **The headline finding is that the edge is energy, not speed.** On an identical bf16 GEMM the NPU is **1.33× faster but 4.45× more energy-efficient** (122.1 vs 27.4 GFLOPS per marginal watt), which reframes every latency-only verdict below — [the first watt](docs/BENCHMARKS.md#the-first-watt-the-npu-is-133-faster-and-445-cheaper-on-the-same-gemm).
+
 ## Does this run on your machine?
 
 Most of this narrowness is not optional.
@@ -187,11 +189,9 @@ Outcomes, mostly negative and all measured:
   `n=64` fits int8's half-size tiles for **4448–4607 GOPS**, a **1.10×–1.83× win at M ≥ 512,
   N ≥ 2048** (thin at K=N=4096; prefill loses). Single-buffering the C output tile frees bf16's
   missing 16 KB too: **2700 GFLOPS** at 2048×4096×4096, **1.89×** same-sitting CPU bf16; int8 gains 13%.
-- **Int8 conv loses, and the op class is closed** — still, after a **3×** fix (register-resident
-  accumulators, 116 → 350 GOPS): CPU wins **2.4×** on marginal rate, **12.75×** at 56×56.
+- **Int8 conv loses; the op class is closed** — after a **3×** fix (register-resident accumulators, 116 → 350 GOPS), CPU still wins **2.4×** marginal and **12.75×** at 56×56.
 - **bf16 attention for MobileViT loses 71×–240×** — not dispatch cost, as first recorded, but `attention_kernels.cc` never calling `aie::mmul`: 0.61 GFLOPS vs 895.
-- **A bf16 GroupNorm beat the CPU on 33 of 49 nodes** of `resnetv2_50x3_bit` — and then
-  the measured two-process handoff floor (789 µs–23.6 ms per call) erased all 33.
+- **A bf16 GroupNorm beat the CPU on 33 of 49 nodes** of `resnetv2_50x3_bit` — then the measured two-process handoff floor (789 µs–23.6 ms/call) erased all 33.
 - **bf16 activations (ReLU/SiLU/GELU) are accurate but never worth dispatching** — **0.77×** at best.
 - **Go/no-go:** CPU time must exceed a *host-set* dispatch floor — **617 µs** one-shot IRON,
   **~531 µs** batched IRON, **36.7 µs** batched C++ (≈ pyxrt: it's the driver's). **1.80 GHz**.

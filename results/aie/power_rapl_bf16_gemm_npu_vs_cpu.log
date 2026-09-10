@@ -1,0 +1,216 @@
+The first watt ever measured in this repo, and it moves the headline finding: on the same
+bf16 GEMM the NPU is **1.33x faster and 4.45x more energy-efficient**. Speed was never the
+interesting half.
+Desktop 2 (Ryzen 7 8700G / Phoenix XDNA1), DESKTOP-CBL5NUA, 2026-09-09, 22:08-22:11.
+Four phases, ONE sitting, 40 s sampled per phase after a 3 s settle, `xrt-smi` clean
+before and after.
+
+WHY THIS EXISTS, AND WHY IT ALMOST DIDN'T
+=========================================
+docs/SILICON.md objective S4 and the backlog's energy study both need a watt, and this
+repo had never measured one. The NPU exposes no power telemetry of its own: `xrt-smi`
+reports `Estimated Power: N/A` and the electrical query fails at the driver escape
+(0xc0000023).
+
+The backlog's plan was to read HWiNFO64's shared-memory sensor export, on the stated
+grounds that "HWiNFO64.INI already has SensorsSM=1, so the export is live". **That premise
+is false.** `C:\Program Files\HWiNFO64\HWiNFO64.INI` contains five keys -- Theme,
+SensorInterval, SensorsOnly, AutoUpdateBetaDisable, AutoUpdate -- and **no `SensorsSM`
+line at all**, so the export is off and nothing can attach to `Global\HWiNFO_SENS_SM2`
+(verified by probing the mapping, not by reading the INI alone). HWiNFO64 also runs
+elevated here, so even with the export enabled a non-elevated reader would likely be
+refused. Turning it on is a GUI checkbox or an admin INI edit plus restarting the user's
+running instance -- a human action.
+
+It turned out not to be needed. **Windows exposes AMD's RAPL counters through PDH
+directly**, with no driver, no elevation, no HWiNFO and no hardware context:
+
+    \Energy Meter(RAPL_Package0_PKG)\Power          package
+    \Energy Meter(RAPL_Package0_CoreN_CORE)\Power   per core, N = 0..7
+    \Energy Meter(_Total)\Power                     reads 0 on this machine, ignored
+
+`tools/power_probe.py` samples them through the built-in `typeperf`.
+
+THE UNIT IS MEASURED, NOT ASSUMED
+=================================
+`Power` is in MILLIWATTS, established by controlled burn rather than from documentation.
+Against a 41.3 W idle, one busy thread steps the package **+9.59 W** and sixteen threads
+step it **+42.1 W, to 83.5 W** -- which is where a 65 W-class Zen 4 desktop part belongs,
+and the one-thread step is right for a single Zen 4 core at boost.
+
+The same counter set exposes `Time` (~1007 units/s, i.e. milliseconds) and `Energy`.
+**`Energy`'s absolute scale is UNRESOLVED** and is not used here: it matches neither
+picojoules, nanojoules, microjoules nor millijoules against the Power reading. It does
+track Power faithfully -- their ratio is constant at 0.0036 across a 2x power range, so
+the two are consistent measurements of the same thing -- but an unexplained scale factor
+is not something to integrate. This probe integrates `Power` and ignores `Energy`.
+
+THE LIMIT THAT SHAPES EVERYTHING BELOW
+======================================
+**The NPU has no power domain of its own.** It shares the package with the CPU, so
+`RAPL_Package0_PKG` includes it while the per-core meters do not. Every NPU figure here is
+therefore a RESIDUAL -- package minus core-sum -- and is only meaningful against an idle
+baseline AND a matched CPU-only control taken in the same sitting. That is S4's stated
+method and it is why phases A and D exist. No bare wattage is quoted anywhere below.
+
+WHAT WAS RUN
+============
+Identical work on both sides: bf16 GEMM at M=K=N=2048, i.e. 17.18 GFLOP per call. NPU is
+the upstream `whole_array` design (4 columns, m=64/k=64/n=32, `--dtype_out f32`); CPU is
+torch bf16 `a @ b`, 8 threads, both from the same ironenv process tree. Per-call times
+were measured standalone, immediately before the power phases:
+
+    CPU  14.436 ms/call   (693 calls in 10.00 s)  -> 1190.1 GFLOPS
+    NPU  10.850 ms/call   (553 calls in  6.00 s)  -> 1583.4 GFLOPS
+
+  python tools/power_probe.py --label A_idle       --duration 40
+  python tools/power_probe.py --label B_cpu_gemm   --duration 40 --command "<cpu loop>"
+  python tools/power_probe.py --label C_npu_gemm   --duration 40 --command "<npu loop>"
+  python tools/power_probe.py --label D_idle_again --duration 40
+
+RESULT
+======
+Raw phase means, 39 samples each:
+
+  phase           package      cores sum   package - cores
+  ---------------------------------------------------------
+  A idle           42.060 W     26.194 W        15.866 W
+  B cpu gemm       85.375 W     58.903 W        26.472 W
+  C npu gemm       54.929 W     27.049 W        27.880 W
+  D idle again     41.864 W     25.229 W        16.635 W
+
+**The drift control passes:** A and D agree to 0.196 W on package (0.5%) and 0.97 W on
+core-sum across a three-minute run, so the idle baseline is stable and the deltas below
+are not riding a trend. Baseline used is the mean of A and D: 41.962 W package, 25.712 W
+cores, 16.251 W residual.
+
+Deltas over that baseline:
+
+  workload    d package    d cores      d residual
+  -------------------------------------------------
+  CPU GEMM     43.413 W     33.191 W       10.221 W
+  NPU GEMM     12.967 W      1.337 W       11.629 W
+
+**This is the attribution, and it is clean.** During the NPU GEMM the cores barely move
+(+1.34 W) while the residual jumps +11.63 W. During the CPU GEMM the opposite happens --
+cores take +33.19 W and the residual moves +10.22 W (uncore and memory traffic serving
+them). So the NPU's draw does land in this package domain, and it lands in the residual
+rather than the cores, which is exactly where a separate accelerator on the same die
+should appear. Had the package not moved while cores stayed flat, this measurement would
+have been impossible and the item's premise would have failed a second time.
+
+ENERGY PER GEMM
+===============
+Two framings, both reported, because they answer different questions.
+
+  metric                             CPU        NPU      NPU advantage
+  ----------------------------------------------------------------------
+  time per GEMM                  14.436 ms   10.850 ms      1.33x
+  throughput                     1190.1 GF   1583.4 GF      1.33x
+  MARGINAL energy per GEMM       0.62671 J   0.14069 J     **4.45x**
+  TOTAL package energy per GEMM  1.23247 J   0.59598 J       2.07x
+  GFLOPS per marginal watt          27.4       122.1       **4.45x**
+  GFLOPS per total package watt      13.9        28.8        2.07x
+
+**Marginal** (delta over idle) is the honest number for "what does this workload cost the
+machine", and it is where the NPU wins 4.45x. **Total** (whole package while running)
+answers "what does the wall see", and the NPU still wins 2.07x -- less, because at these
+power levels the ~42 W the machine burns at idle dominates, and that idle is itself
+inflated by a peer process (see CONTENTION).
+
+The shape of the finding matters more than either figure: **the NPU is barely faster and
+dramatically cheaper.** A 1.33x speedup would be a marginal reason to use this hardware.
+A 4.45x energy advantage at the same throughput is a different proposition, and it is the
+first evidence in this repo for the thing NPUs are supposed to be for.
+
+CONTENTION
+==========
+A peer process (PID 22396, `miniforge3\python.exe -`, running since 15:15) was live
+throughout and took 24,647.2 -> 24,845.2 CPU-seconds across the run: 198 CPU-s over 199 s
+of wall clock, i.e. **a steady ~1.0 core in every phase, including both idle phases**.
+
+It inflates the idle baseline and it is present in all four phases, so the DELTAS still
+isolate the measured workload -- which is precisely what a matched idle baseline is for.
+The A-vs-D agreement (0.5% on package) is the evidence that its load was constant rather
+than drifting. What it does bias is the TOTAL-energy column, by raising the idle floor
+both workloads are charged for; the marginal column is unaffected. `xrt-smi` reported no
+hardware contexts before or after, so nothing foreign touched the NPU.
+
+WHAT THIS DOES NOT ESTABLISH
+============================
+- **One shape, one sitting, one dtype.** 2048^3 bf16 is a shape where the NPU already
+  wins on throughput. At shapes where it loses on time (512^3, or anything under the
+  dispatch floor) the energy verdict could invert, and nothing here tests that.
+- **Not a per-frame or per-model figure.** This is joules per GEMM, not joules per
+  inference. The backlog's J/frame study over real models is still open and is the point
+  of building this instrument.
+- **The CPU leg is torch bf16 at 8 threads**, the repo's established bf16 baseline, not a
+  hand-tuned AVX-512 kernel and not all 16 threads. More threads would raise both
+  throughput and power; which way the ratio moves is untested. Given how badly a
+  single-implementation CPU baseline misled the activation sweep earlier today, treat the
+  CPU column as one implementation's number rather than the CPU's ceiling.
+- **The NPU residual is not purely the NPU.** It is uncore + SoC + NPU + memory
+  controller. The +11.63 W is an upper bound on the NPU's own draw, not an isolate; the
+  CPU phase's own +10.22 W residual shows how much of that term is memory traffic rather
+  than compute.
+- **No iGPU leg**, and no measurement of the idle NPU (whether an unused NPU costs
+  anything at all).
+
+RAW OUTPUT
+================================================================================
+﻿=== RAPL power: idle vs CPU bf16 GEMM vs NPU bf16 GEMM. start 2026-09-09 22:08:12 ===
+host: DESKTOP-CBL5NUA   logical cores: 16
+--- device before ---
+
+-----------------------------
+[003d:00:01.1] : NPU Phoenix
+-----------------------------
+AIE Partitions
+  No hardware contexts running on device
+
+--- peer before: PID22396 CPU_s=24,647.2
+
+### phase A: idle baseline (22:08:12)
+=== A_idle ===
+  package   mean  42.060 W   min  40.028   max  49.189   n=39
+  cores sum mean  26.194 W   min  23.747   max  36.984
+  package - cores   15.866 W   (uncore + SoC + NPU; NOT an NPU figure on its own)
+
+### phase B: CPU bf16 GEMM 2048^3, 8 threads (22:08:53)
+=== B_cpu_gemm ===
+  package   mean  85.375 W   min  84.542   max  86.117   n=39
+  cores sum mean  58.903 W   min  57.735   max  60.422
+  package - cores   26.472 W   (uncore + SoC + NPU; NOT an NPU figure on its own)
+
+--- settle 15 s ---
+### phase C: NPU bf16 GEMM 2048^3, 4 columns (22:09:52)
+=== C_npu_gemm ===
+  package   mean  54.929 W   min  53.118   max  56.320   n=39
+  cores sum mean  27.049 W   min  24.674   max  29.411
+  package - cores   27.880 W   (uncore + SoC + NPU; NOT an NPU figure on its own)
+
+--- settle 15 s ---
+### phase D: idle again (drift control) (22:10:51)
+=== D_idle_again ===
+  package   mean  41.864 W   min  39.412   max  53.139   n=39
+  cores sum mean  25.229 W   min  22.911   max  28.082
+  package - cores   16.635 W   (uncore + SoC + NPU; NOT an NPU figure on its own)
+
+--- device after ---
+
+-----------------------------
+[003d:00:01.1] : NPU Phoenix
+-----------------------------
+AIE Partitions
+  No hardware contexts running on device
+
+--- peer after: PID22396 CPU_s=24,845.2
+=== end 2026-09-09 22:11:31 ===
+
+--- raw phase JSON ---
+{"package": {"mean_mw": 42059.86297339005, "median_mw": 41684.98346101216, "min_mw": 40027.90098887034, "max_mw": 49189.29223992276, "n": 39}, "core_sum": {"mean_mw": 26194.045085508697, "median_mw": 25696.299068264532, "min_mw": 23747.2746873085, "max_mw": 36984.22672934365, "n": 39}, "per_core": {"core0": {"mean_mw": 1635.2999098908738, "median_mw": 1659.1625350492486, "min_mw": 977.9051321261666, "max_mw": 3763.154126024052, "n": 39}, "core1": {"mean_mw": 479.8808106522884, "median_mw": 445.31895908914925, "min_mw": 345.17453694426155, "max_mw": 1032.759237106742, "n": 39}, "core2": {"mean_mw": 2012.446560408031, "median_mw": 1851.1629435941093, "min_mw": 1562.873054202214, "max_mw": 4912.136229075265, "n": 39}, "core3": {"mean_mw": 11535.739423768755, "median_mw": 11952.249995512331, "min_mw": 5615.1528157805315, "max_mw": 15951.708524361142, "n": 39}, "core4": {"mean_mw": 386.8088390944942, "median_mw": 347.2644491819463, "min_mw": 226.66408543864745, "max_mw": 998.1991807584728, "n": 39}, "core5": {"mean_mw": 8776.525528776447, "median_mw": 8786.733219707932, "min_mw": 3538.6306421302697, "max_mw": 14790.809684511023, "n": 39}, "core6": {"mean_mw": 834.8388976059239, "median_mw": 774.9385227979735, "min_mw": 532.893975610889, "max_mw": 2218.652941698465, "n": 39}, "core7": {"mean_mw": 532.5051153118852, "median_mw": 503.8208890164684, "min_mw": 351.3320416254071, "max_mw": 1445.8891219775383, "n": 39}}, "label": "A_idle", "wall_s": 40.58852410316467, "command": null, "sampled_s": 40.0, "interval_s": 1.0}
+{"package": {"mean_mw": 85375.48372306555, "median_mw": 85425.93001895424, "min_mw": 84542.38574813273, "max_mw": 86116.8951907237, "n": 39}, "core_sum": {"mean_mw": 58902.997561317614, "median_mw": 58801.060899464865, "min_mw": 57734.955685313165, "max_mw": 60421.506566683864, "n": 39}, "per_core": {"core0": {"mean_mw": 7532.559583849394, "median_mw": 7537.115024242985, "min_mw": 6999.1464407693375, "max_mw": 8440.987396683971, "n": 39}, "core1": {"mean_mw": 3843.9355653052235, "median_mw": 3782.609317919158, "min_mw": 3019.7996956199495, "max_mw": 5019.439976001051, "n": 39}, "core2": {"mean_mw": 8021.654605314828, "median_mw": 7969.666930546195, "min_mw": 7482.762624441428, "max_mw": 8739.776464703085, "n": 39}, "core3": {"mean_mw": 9367.94383538226, "median_mw": 9336.40208384022, "min_mw": 8935.772806384513, "max_mw": 10152.598839363773, "n": 39}, "core4": {"mean_mw": 6342.094371502379, "median_mw": 6280.129350203395, "min_mw": 5756.436223780214, "max_mw": 7430.762758601185, "n": 39}, "core5": {"mean_mw": 9231.254543313256, "median_mw": 9249.7125651595, "min_mw": 8518.932926074798, "max_mw": 9821.891298301169, "n": 39}, "core6": {"mean_mw": 7242.144219265756, "median_mw": 7309.109720106119, "min_mw": 6693.778480292448, "max_mw": 7748.579947872401, "n": 39}, "core7": {"mean_mw": 7321.41083738452, "median_mw": 7289.4861654441, "min_mw": 6576.895308143175, "max_mw": 8081.281324800413, "n": 39}}, "label": "B_cpu_gemm", "wall_s": 40.723061323165894, "command": "python C:\\Users\\<user>\\.claude\\jobs\\29ef4d5a\\tmp\\cpu_gemm_loop.py --seconds 60", "sampled_s": 40.0, "interval_s": 1.0}
+{"package": {"mean_mw": 54929.03413156352, "median_mw": 54901.779574697175, "min_mw": 53117.61139861406, "max_mw": 56319.87419586961, "n": 39}, "core_sum": {"mean_mw": 27049.058368191832, "median_mw": 27085.256425018608, "min_mw": 24673.810607181513, "max_mw": 29410.75405452275, "n": 39}, "per_core": {"core0": {"mean_mw": 1725.9898991642376, "median_mw": 1647.3739097512905, "min_mw": 1309.0538487992205, "max_mw": 2247.8818924450593, "n": 39}, "core1": {"mean_mw": 471.9571681843414, "median_mw": 473.72683975536927, "min_mw": 394.0761196515183, "max_mw": 614.3069368085007, "n": 39}, "core2": {"mean_mw": 2298.6357474529636, "median_mw": 2236.7780171803797, "min_mw": 1819.5765157230915, "max_mw": 3264.656744182699, "n": 39}, "core3": {"mean_mw": 11381.199557009504, "median_mw": 11452.239540859173, "min_mw": 4452.172412074967, "max_mw": 16315.652050643332, "n": 39}, "core4": {"mean_mw": 371.2014629925788, "median_mw": 378.31746469803596, "min_mw": 255.89199812854883, "max_mw": 474.2479315991324, "n": 39}, "core5": {"mean_mw": 9461.494877806683, "median_mw": 9416.050222994394, "min_mw": 4779.038229940281, "max_mw": 16220.730626872895, "n": 39}, "core6": {"mean_mw": 826.9985770552472, "median_mw": 831.7356035878953, "min_mw": 658.4924418831318, "max_mw": 975.7566857975896, "n": 39}, "core7": {"mean_mw": 511.58107852627813, "median_mw": 494.5266786655707, "min_mw": 369.05283182722525, "max_mw": 646.2531245397164, "n": 39}}, "label": "C_npu_gemm", "wall_s": 40.58479857444763, "command": "python C:\\Users\\<user>\\.claude\\jobs\\29ef4d5a\\tmp\\npu_gemm_loop.py --seconds 60", "sampled_s": 40.0, "interval_s": 1.0}
+{"package": {"mean_mw": 41863.70091403988, "median_mw": 41267.17258356812, "min_mw": 39411.93695062785, "max_mw": 53139.19739493558, "n": 39}, "core_sum": {"mean_mw": 25228.758017083845, "median_mw": 24918.070711185228, "min_mw": 22911.279224626458, "max_mw": 28081.921589915793, "n": 39}, "per_core": {"core0": {"mean_mw": 1194.5276079619007, "median_mw": 1102.4022753977022, "min_mw": 778.3728381654086, "max_mw": 2117.303523763458, "n": 39}, "core1": {"mean_mw": 414.99345956680435, "median_mw": 414.4684567313543, "min_mw": 303.5143204218743, "max_mw": 574.0734208526953, "n": 39}, "core2": {"mean_mw": 1870.920609559511, "median_mw": 1759.49492729477, "min_mw": 1229.2756168596493, "max_mw": 2678.379972123941, "n": 39}, "core3": {"mean_mw": 11120.892499637528, "median_mw": 11172.92291671832, "min_mw": 6841.639639863176, "max_mw": 16086.777926858143, "n": 39}, "core4": {"mean_mw": 298.54228297039845, "median_mw": 293.9816373319915, "min_mw": 208.42269203364776, "max_mw": 391.01230983295824, "n": 39}, "core5": {"mean_mw": 9305.573453022966, "median_mw": 8921.989259632064, "min_mw": 4060.7994450395013, "max_mw": 14344.82394990795, "n": 39}, "core6": {"mean_mw": 627.8770617834257, "median_mw": 622.228563786155, "min_mw": 465.07893700298433, "max_mw": 810.6981558647228, "n": 39}, "core7": {"mean_mw": 395.43104258131103, "median_mw": 396.2189894377059, "min_mw": 276.3314773492013, "max_mw": 495.4327225648679, "n": 39}}, "label": "D_idle_again", "wall_s": 40.56840229034424, "command": null, "sampled_s": 40.0, "interval_s": 1.0}
+
+--- unit calibration burn (separate run, same evening) ---

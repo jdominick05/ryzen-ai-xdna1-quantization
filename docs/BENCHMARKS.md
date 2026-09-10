@@ -1561,6 +1561,72 @@ activation epilogue or argues against one — `ml/mm_activation_epilogue` is the
 would answer it and is Strix-only in this tree. Sigmoid was not measured (the design
 offers relu/silu/gelu only), and there is no iGPU leg.
 
+### The first watt: the NPU is 1.33× faster and 4.45× cheaper on the same GEMM
+
+Every "is it worth it" verdict in this file has been a latency verdict, while the part's
+stated reason to exist is work per watt — `docs/SILICON.md` S4 says so, and says nothing
+here had ever measured a watt. Something has now.
+
+**The route S4 proposed does not work, and did not need to.** S4 named HWiNFO's
+shared-memory export or a direct SMU read, and said "it may be neither" — correct on both.
+The backlog asserted `HWiNFO64.INI` already had `SensorsSM=1`; it does not, the file has no
+such key, the export is off, and HWiNFO here runs elevated so a non-elevated reader would
+likely be refused anyway. But **Windows publishes AMD's RAPL counters through PDH** — a
+third path, needing no driver, no elevation and no hardware context:
+`\Energy Meter(RAPL_Package0_PKG)\Power` plus eight per-core meters. `tools/power_probe.py`
+samples them via built-in `typeperf`.
+
+**The unit is MEASURED, not read off a doc.** `Power` is milliwatts: against a 41.3 W idle,
+one busy thread steps the package **+9.59 W** and sixteen step it **+42.1 W to 83.5 W**,
+which is where a 65 W-class Zen 4 desktop part belongs. The set also exposes `Energy`,
+whose absolute scale resolves to **no** standard unit against Power (it tracks Power
+faithfully — ratio constant at 0.0036 across a 2× range — but the scale factor is
+unexplained), so the probe integrates Power and ignores Energy. TO VERIFY if anyone needs
+`Energy` directly.
+
+Identical work both sides: bf16 GEMM at 2048³, 17.18 GFLOP per call. NPU is `whole_array`
+(4 columns, `--dtype_out f32`) at 10.850 ms/call; CPU is torch bf16, 8 threads, at
+14.436 ms/call. Four phases, one sitting, 40 s sampled each.
+
+| phase | package | cores sum | package − cores |
+|---|---|---|---|
+| A idle | 42.060 W | 26.194 W | 15.866 W |
+| B CPU GEMM | 85.375 W | 58.903 W | 26.472 W |
+| C NPU GEMM | 54.929 W | 27.049 W | 27.880 W |
+| D idle again | 41.864 W | 25.229 W | 16.635 W |
+
+**S4's own attribution test passes.** It asks for "package rising while the cores stay
+flat", and that is exactly what the NPU phase does: cores **+1.34 W** while the residual
+takes **+11.63 W**. The CPU phase is the mirror — cores **+33.19 W**, residual +10.22 W
+(memory traffic serving them). So the NPU's draw is inside this package domain and lands
+outside the cores. A and D agree to 0.196 W (0.5%), so the baseline is not drifting.
+
+| metric | CPU | NPU | NPU advantage |
+|---|---|---|---|
+| time per GEMM | 14.436 ms | 10.850 ms | 1.33× |
+| throughput | 1190.1 GFLOPS | 1583.4 GFLOPS | 1.33× |
+| **marginal energy per GEMM** | 0.6267 J | 0.1407 J | **4.45×** |
+| total package energy per GEMM | 1.2325 J | 0.5960 J | 2.07× |
+| **GFLOPS per marginal watt** | 27.4 | 122.1 | **4.45×** |
+
+**S4's question — "whether the NPU's edge is work per watt where it is not work per
+second" — is answered yes.** A 1.33× speedup is a thin reason to use this hardware; a
+4.45× energy advantage at that throughput is a different proposition, and it reframes
+every latency-only verdict above. Marginal (delta over idle) is the honest cost-of-work
+figure; total package energy still favours the NPU 2.07×, less because the ~42 W idle
+floor dominates at these levels.
+
+**Caveats, and they are real.** One shape, one dtype, one sitting — 2048³ is a shape where
+the NPU already wins on time, and at shapes under the dispatch floor the energy verdict
+could invert; untested. The NPU residual is uncore + SoC + NPU + memory controller, so
++11.63 W is an **upper bound** on the NPU's own draw, not an isolate. The CPU leg is torch
+bf16 at 8 threads — one implementation, not the CPU's ceiling, and the activation sweep
+earlier the same day showed how badly a single-implementation CPU baseline can mislead. A
+peer process held a steady ~1.0 core through all four phases: it inflates the idle floor
+(biasing the *total* column) but cancels from the deltas, which is what the matched
+baseline is for. No iGPU leg, and joules-per-frame over real models is still open — that
+study is why this instrument exists. `results/aie/power_rapl_bf16_gemm_npu_vs_cpu.log`.
+
 ### The AIE core clock, measured: 1.80 GHz default, 0.80 powersaver
 
 Every per-second ceiling this repo derives for the array — TOPS per column, bytes per

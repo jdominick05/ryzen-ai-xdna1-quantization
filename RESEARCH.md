@@ -67,6 +67,23 @@ a one-off workaround: it took the EP from 0/965 nodes to 922/929, and the model 
 The numbers live in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md). What's worth stating as findings, because they
 generalize beyond any one model:
 
+0. **The edge is work per watt, not work per second — and until 2026-09-09 this repo had
+   never measured a watt, so every verdict in it was answering the wrong question.** On an
+   identical bf16 2048³ GEMM the NPU is **1.33× faster and 4.45× more energy-efficient**
+   (0.1407 J against 0.6267 J of marginal package energy per GEMM; 122.1 against 27.4
+   GFLOPS per marginal watt). A 1.33× speedup is a thin reason to use this hardware. A
+   4.45× energy advantage at the same throughput is a different proposition entirely, and
+   it reframes every latency-only comparison in this repository — the ones the NPU loses
+   narrowly, and the ones it "wins" by margins that never justified the integration cost.
+   The instrument arrived late and by accident: AMD's RAPL counters turn out to be
+   published through Windows' PDH (`\Energy Meter(RAPL_Package0_PKG)\Power`), needing no
+   driver, no elevation and no hardware context, after the route `docs/SILICON.md` S4
+   proposed — HWiNFO's shared-memory export — turned out to be switched off on this
+   machine. What is *not* established: this is one shape, one dtype, one sitting; the NPU
+   figure is a residual (package minus cores) and therefore an upper bound rather than an
+   isolate; and joules-per-frame over real models is still unmeasured. See
+   [the first watt](docs/BENCHMARKS.md#the-first-watt-the-npu-is-133-faster-and-445-cheaper-on-the-same-gemm).
+
 1. **Graph shape matters more than graph size, and the EP gives you nothing to debug
    it with.** A model can be entirely rejected — not partitioned badly, rejected
    wholesale — and the only ground truth is `vitisai_ep_report.json`, which the

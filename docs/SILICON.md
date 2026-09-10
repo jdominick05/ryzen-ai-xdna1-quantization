@@ -538,7 +538,24 @@ and of `conv2dk3` that writes cycle deltas into a side buffer. Measurement: MACs
 per core directly, independent of host timing and of S2. Decides: the same questions as
 S2 at lower fidelity and zero toolchain risk; use whichever lands first.
 
-**S4. Package power under load, and the NPU's share of it.**
+**S4. Package power under load, and the NPU's share of it.** — **FIRST MEASUREMENT TAKEN
+(2026-09-09, Desktop 2).** The read path S4 could not predict turns out to be a third one:
+not HWiNFO's shared-memory export (off here — `HWiNFO64.INI` has no `SensorsSM` key at all,
+and HWiNFO runs elevated), not a direct SMU read, but **AMD's RAPL counters published
+through PDH** — `\Energy Meter(RAPL_Package0_PKG)\Power` plus eight per-core meters, no
+driver, no elevation, no hardware context. MEASURED: `Power` is in milliwatts, established
+by controlled burn (one thread +9.59 W, sixteen +42.1 W to 83.5 W over a 41.3 W idle), not
+from documentation. `tools/power_probe.py`. On the same bf16 2048³ GEMM, one sitting, with
+an idle baseline and a repeat-idle drift control agreeing to 0.5%: **the NPU is 1.33×
+faster and 4.45× more energy-efficient** (0.1407 J vs 0.6267 J marginal per GEMM; 122.1 vs
+27.4 GFLOPS per marginal watt). **S4's own attribution test passes** — cores move +1.34 W
+while the residual takes +11.63 W, i.e. package rising while cores stay flat, so the draw
+is outside the cores. **So S4's deciding question answers YES: the NPU's edge is work per
+watt where it is barely work per second.** Still open: one shape only, the residual is an
+upper bound rather than an isolate (uncore + SoC + NPU + memory controller), no iGPU leg,
+and joules-per-frame over real models. `results/aie/power_rapl_bf16_gemm_npu_vs_cpu.log`,
+[BENCHMARKS](BENCHMARKS.md#the-first-watt-the-npu-is-133-faster-and-445-cheaper-on-the-same-gemm).
+Original entry, kept because its reasoning is what made the measurement designable:
 Physical basis: nothing in this repo has ever measured a watt. 1.7 has the clock and the
 GPU-engine utilization percentage, and every "is it worth it" verdict in
 `docs/BENCHMARKS.md` — the iGPU comparison, MobileNetV2 being too cheap to accelerate,
