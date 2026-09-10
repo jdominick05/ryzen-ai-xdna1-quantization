@@ -153,6 +153,35 @@ did the work — not this counter.
 
 Caveat: yolov8m's mAP was originally measured on a calib-64 quantization (`results/wide/map_yolov8m_npu.log`), not calib-200 like n/s above. Re-measuring it under `./scripts/yolo-bench.sh --variants "m" --calib 200 --no-adaround` produces **43.38 mAP@50-95** and **59.62 mAP@50** at **26.95 ms** (`results/bench/map_yolov8m_cut_xint8_c200_npu.log`, `results/bench/lat_yolov8m_cut_xint8_c200_npu.log`, `results/bench/diag_yolov8m_cut_xint8_c200.log`). The mAP delta is just -0.11 points, closing the caveat and proving that calibration sample count past 64 does not meaningfully change the quantization operating point. The full 5000-image FP32 CPU baseline for yolov8m was also measured in this run: **49.54 mAP@50-95, 66.09 mAP@50** at **144.12 ms** (`results/bench/map_yolov8m_cpu.log`, `results/bench/lat_yolov8m_cpu.log`).
 
+**yolov8l closes the same caveat the same way, from the other direction (2026-09-09).** l
+was the width where calibration was starved hardest — 32 images — so if sample count ever
+mattered it should show here. Re-evaluated at calib 200 over the full 5000: **45.59
+mAP@50-95, 62.55 mAP@50** at **46.27 ms**, against **45.37 / 62.34** at **46.33 ms** for
+the calib-32 artifact. The delta is **+0.22 points**, the mirror image of m's −0.11 and
+the same verdict: **past ~32–64 images, calibration sample count does not move the
+quantization operating point at these widths.** Small/medium/large track it (28.99 /
+50.89 / 58.23 against 28.78 / 50.39 / 58.24), and latency is unchanged, as it must be —
+calibration size cannot affect the compiled graph's shape. Note the *detection count*
+falls, 466,220 against 486,694: better calibration emits ~4% fewer low-confidence boxes
+while scoring marginally higher, which is the expected direction.
+
+That run is clean on both of the checks a number like this needs. The EP's own report puts
+**1510 of 1517 nodes on the NPU** (7 CPU nodes, all Quantize/DequantizeLinear at the
+boundary — `results/diag_yolov8l_cut_xint8_c200.log`), so it is a real NPU result rather
+than a CPU run in an NPU costume. And the `hwinfo_npu_bridge` witness sampled the whole
+run: 348 samples, **exactly one hardware context throughout, never two**
+(`results/witness_yolov8l_cut_xint8_c200_npu.jsonl`), with the harness's own host-load
+guard reporting 1.45 busy cores of 16 at start. `results/map_yolov8l_cut_xint8_c200_npu.log`.
+
+Provenance caveat on the artifact, stated because it was inferred rather than logged:
+`models/yolov8l_cut_xint8_c200.onnx` was **not quantized on this machine**. It carries no
+local `quant_` log while n/s/m all do, and `models/` is a Syncthing folder hubbed on
+Desktop 1, which is where CLAUDE.md routes wide/large calibration and which has no NPU. So
+"quantized on Desktop 1, synced in, never evaluated" is the reading; its quant log should
+be on Desktop 1. The eval forced `--fresh`, which is mandatory after a sync-in because
+compile caches key on name rather than model hash. **yolov8x at calib 200 remains
+unmeasured** — no such artifact exists on this machine.
+
 **The last two width steps: l and x.** Disk was the blocker (`calib_mb_per_image`
 extrapolates ~1-1.5 GB/calibration-image at 640×640), so both are calibrated smaller
 than m — 32 images for l, 24 for x — another calibration-size caveat, same reasoning as
