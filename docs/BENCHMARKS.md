@@ -1627,6 +1627,69 @@ peer process held a steady ~1.0 core through all four phases: it inflates the id
 baseline is for. No iGPU leg, and joules-per-frame over real models is still open — that
 study is why this instrument exists. `results/aie/power_rapl_bf16_gemm_npu_vs_cpu.log`.
 
+### Joules per frame: the NPU does 11.3× the inferences per joule of the CPU, 5.9× the iGPU
+
+The GEMM measurement above answered "how much energy does this arithmetic cost" on a
+synthetic shape with no iGPU leg. This answers the question the backlog actually asks —
+joules per *frame*, on a real model, across all three providers. ResNet50, batch 1, single
+stream, six power phases in one sitting. `results/aie/power_rapl_resnet50_joules_per_frame.log`.
+
+| phase | package | cores | residual | fps |
+|---|---|---|---|---|
+| A idle | 41.304 W | 25.078 W | 16.226 W | — |
+| B CPU fp32 | 82.495 W | 63.551 W | 18.944 W | 70.9 |
+| C iGPU (DML) fp32 | 86.302 W | 22.648 W | 63.654 W | 148.0 |
+| D NPU xint8 | 51.591 W | 26.061 W | 25.530 W | 198.2 |
+| E CPU xint8 *(control)* | 73.714 W | 59.077 W | 14.636 W | 30.1 |
+| F idle again | 41.633 W | 24.724 W | 16.909 W | — |
+
+**Medians, not means, and it matters:** F's *mean* package is 44.815 W against A's 41.513,
+an 8% apparent drift that would undermine every delta — but F's max is 74.0 W, i.e. one
+transient peer burst inside an otherwise idle window. The medians are 41.304 and 41.633 W,
+**0.8% apart**. Baseline is their mean, 41.469 W.
+
+| arm | J/frame marginal | J/frame total | frames per marginal joule |
+|---|---|---|---|
+| CPU fp32 | 0.5787 | 1.1635 | 1.73 |
+| iGPU (DML) fp32 | 0.3029 | 0.5831 | 3.30 |
+| **NPU xint8** | **0.0511** | **0.2603** | **19.58** |
+| CPU xint8 *(control)* | 1.0713 | 2.4490 | 0.93 |
+
+**NPU vs CPU: 11.33× more efficient and 2.80× faster. NPU vs iGPU: 5.93× and 1.34×.**
+
+**The dtype control rules out the obvious alternative.** The NPU runs XINT8 while CPU and
+iGPU run FP32, so the three-way comparison alone cannot separate "the NPU is efficient"
+from "int8 is cheap". Phase E runs the CPU on the *same* XINT8 artifact: it goes the wrong
+way, hard — **slower than CPU fp32** (30.1 vs 70.9 fps) and **1.85× less efficient per
+frame**. ORT's QDQ int8 path is a pessimization on this CPU, so the NPU's 11.3× is the
+hardware executing a quantized graph natively, not quantization itself.
+
+**Each provider lights up where it lives**, which is what makes the attribution safe: the
+CPU arms put nearly all their draw in the cores (+38.7 W); the **iGPU's cores drop *below*
+idle** (−2.25 W — the CPU is waiting on it) while its residual takes **+47.09 W**; the NPU
+takes +8.96 W residual for +1.16 W of cores, the same signature the GEMM sitting found.
+Secondary: the iGPU draws the most package power of any arm (86.3 W, more than the
+all-core CPU phase) yet still beats the CPU on energy, because it is 2.09× faster. The
+ordering is **NPU ≫ iGPU > CPU**.
+
+**A contaminated measurement was caught and retracted here.** The study took each arm's
+throughput immediately after its power phase, and all four came out ~half true value (CPU
+37.5 vs 70.9; iGPU 72.3 vs 148.0; NPU 90.6 vs 198.2; CPU-int8 18.1 vs 30.1) because
+`power_probe.py` terminates its workload when sampling ends and the 95 s hold had not
+exited before the next run started — two sessions competing for one provider. It was
+caught by consistency check, not luck: 90.6 fps contradicted this repo's own documented
+5.27 ms ResNet50 NPU latency, and a clean re-run gave 198.2 fps with samples spanning
+197.7–198.7. The **power phases are unaffected** — each ran exactly one workload, the
+condition the throughput runs violated.
+
+**Not established:** one model, batch 1, single stream — ResNet50 INT8 is the NPU's best
+case; 60 s windows, not the 15–30 min sustained thermal steady state the backlog asks for;
+throughput and power come from different windows minutes apart, so J/frame is a product of
+two separately-measured quantities; the NPU residual is an upper bound (uncore + SoC +
+memory + NPU); no accuracy axis, so this compares energy at fixed *work*, not fixed
+accuracy; and idle is not free — the machine burns ~41.5 W doing nothing, which is why the
+marginal and total columns differ so much and why a battery platform would look different.
+
 ### The AIE core clock, measured: 1.80 GHz default, 0.80 powersaver
 
 Every per-second ceiling this repo derives for the array — TOPS per column, bytes per

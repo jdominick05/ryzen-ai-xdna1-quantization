@@ -551,9 +551,19 @@ faster and 4.45× more energy-efficient** (0.1407 J vs 0.6267 J marginal per GEM
 27.4 GFLOPS per marginal watt). **S4's own attribution test passes** — cores move +1.34 W
 while the residual takes +11.63 W, i.e. package rising while cores stay flat, so the draw
 is outside the cores. **So S4's deciding question answers YES: the NPU's edge is work per
-watt where it is barely work per second.** Still open: one shape only, the residual is an
-upper bound rather than an isolate (uncore + SoC + NPU + memory controller), no iGPU leg,
-and joules-per-frame over real models. `results/aie/power_rapl_bf16_gemm_npu_vs_cpu.log`,
+watt where it is barely work per second.** **Extended the same day to a real model and all
+three providers:** ResNet50 at batch 1 gives the NPU **19.6 inferences per joule against
+the iGPU's 3.3 and the CPU's 1.7 — 11.3× and 5.9×** — at only 2.80× and 1.34× the
+throughput, with a CPU-on-the-same-INT8-artifact control ruling out the dtype confound
+(that arm is *slower* than CPU FP32 and 1.85× less efficient per frame). Provider
+attribution is unambiguous there too: the iGPU's cores fall *below* idle while its residual
+takes +47.09 W, placing the 780M in the SoC domain, and the NPU takes +8.96 W residual for
++1.16 W of cores. `results/aie/power_rapl_resnet50_joules_per_frame.log`,
+[joules per frame](BENCHMARKS.md#joules-per-frame-the-npu-does-113-the-inferences-per-joule-of-the-cpu-59-the-igpu).
+Still open: batch 1 and one model only, 60 s windows rather than sustained thermal steady
+state, throughput and power captured in separate windows, and a residual that is an upper
+bound rather than an isolate (uncore + SoC + NPU + memory controller).
+`results/aie/power_rapl_bf16_gemm_npu_vs_cpu.log`,
 [BENCHMARKS](BENCHMARKS.md#the-first-watt-the-npu-is-133-faster-and-445-cheaper-on-the-same-gemm).
 Original entry, kept because its reasoning is what made the measurement designable:
 Physical basis: nothing in this repo has ever measured a watt. 1.7 has the clock and the

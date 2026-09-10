@@ -68,21 +68,28 @@ The numbers live in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md). What's worth sta
 generalize beyond any one model:
 
 0. **The edge is work per watt, not work per second — and until 2026-09-09 this repo had
-   never measured a watt, so every verdict in it was answering the wrong question.** On an
-   identical bf16 2048³ GEMM the NPU is **1.33× faster and 4.45× more energy-efficient**
-   (0.1407 J against 0.6267 J of marginal package energy per GEMM; 122.1 against 27.4
-   GFLOPS per marginal watt). A 1.33× speedup is a thin reason to use this hardware. A
-   4.45× energy advantage at the same throughput is a different proposition entirely, and
-   it reframes every latency-only comparison in this repository — the ones the NPU loses
-   narrowly, and the ones it "wins" by margins that never justified the integration cost.
+   never measured a watt, so every verdict in it was answering the wrong question.** On
+   ResNet50 the NPU runs **19.6 inferences per joule against the iGPU's 3.3 and the CPU's
+   1.7 — 11.3× the CPU and 5.9× the iGPU** — while being only 2.80× and 1.34× faster. The
+   same shape holds on a synthetic bf16 2048³ GEMM against the CPU: 1.33× faster, 4.45×
+   cheaper. **The confound is controlled, not assumed:** the NPU runs INT8 while CPU and
+   iGPU run FP32, so a fourth arm ran the CPU on the *same* INT8 artifact — it came out
+   *slower* than CPU FP32 (30.1 vs 70.9 fps) and 1.85× less efficient, so the advantage is
+   the hardware executing a quantized graph natively, not "int8 is cheaper". Speed ratios
+   of 1.3–2.8× are a thin reason to accept this integration cost. An order of magnitude in
+   energy is a different proposition entirely, and it reframes every latency-only
+   comparison in this repository — the ones the NPU loses narrowly, and the ones it "wins"
+   by margins that never justified the work.
    The instrument arrived late and by accident: AMD's RAPL counters turn out to be
    published through Windows' PDH (`\Energy Meter(RAPL_Package0_PKG)\Power`), needing no
    driver, no elevation and no hardware context, after the route `docs/SILICON.md` S4
    proposed — HWiNFO's shared-memory export — turned out to be switched off on this
-   machine. What is *not* established: this is one shape, one dtype, one sitting; the NPU
-   figure is a residual (package minus cores) and therefore an upper bound rather than an
-   isolate; and joules-per-frame over real models is still unmeasured. See
-   [the first watt](docs/BENCHMARKS.md#the-first-watt-the-npu-is-133-faster-and-445-cheaper-on-the-same-gemm).
+   machine. What is *not* established: one model at batch 1 (ResNet50 INT8 is the NPU's
+   best case), 60-second windows rather than sustained thermal steady state, throughput and
+   power captured in different windows, and an NPU figure that is a residual (package minus
+   cores) and so an upper bound rather than an isolate. See
+   [joules per frame](docs/BENCHMARKS.md#joules-per-frame-the-npu-does-113-the-inferences-per-joule-of-the-cpu-59-the-igpu)
+   and [the first watt](docs/BENCHMARKS.md#the-first-watt-the-npu-is-133-faster-and-445-cheaper-on-the-same-gemm).
 
 1. **Graph shape matters more than graph size, and the EP gives you nothing to debug
    it with.** A model can be entirely rejected — not partitioned badly, rejected

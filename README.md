@@ -9,7 +9,7 @@ reproducible end to end, but the deliverable is measurements: every number below
 backed by a log under [`results/`](results/README.md), and the most useful part of the
 repo is probably the set of XDNA1 facts that are undocumented or documented incorrectly.
 
-> **The headline finding is that the edge is energy, not speed.** On an identical bf16 GEMM the NPU is **1.33× faster but 4.45× more energy-efficient** (122.1 vs 27.4 GFLOPS per marginal watt), which reframes every latency-only verdict below — [the first watt](docs/BENCHMARKS.md#the-first-watt-the-npu-is-133-faster-and-445-cheaper-on-the-same-gemm).
+> **The headline finding is that the edge is energy, not speed.** On ResNet50 the NPU runs **19.6 inferences per joule against the iGPU's 3.3 and the CPU's 1.7 — 11.3× the CPU, 5.9× the iGPU** — while being only 2.8× and 1.34× faster. A CPU-on-the-same-INT8-artifact control rules out "int8 is just cheaper". This reframes every latency-only verdict below: [joules per frame](docs/BENCHMARKS.md#joules-per-frame-the-npu-does-113-the-inferences-per-joule-of-the-cpu-59-the-igpu), [the first watt](docs/BENCHMARKS.md#the-first-watt-the-npu-is-133-faster-and-445-cheaper-on-the-same-gemm).
 
 ## Does this run on your machine?
 

@@ -660,6 +660,25 @@ got the same oracle. Patching `whole_array.py` changes its JIT-cache hash, so th
 each config recompiles (seconds). CPU timings were taken beside another session's yolov6n
 evaluation runs. Cited by [`kernels/README.md`](../../kernels/README.md).
 
+**`power_rapl_resnet50_joules_per_frame.log`** — the first per-model energy numbers here,
+and the strongest form of this repo's headline: on ResNet50 at batch 1 the NPU runs **19.6
+inferences per joule against the iGPU's 3.3 and the CPU's 1.7 — 11.3× the CPU and 5.9× the
+iGPU** — at only 2.80× and 1.34× the throughput. **The dtype confound is controlled, not
+assumed**: a fourth arm runs the CPU on the *same* XINT8 artifact the NPU uses and comes
+out *slower* than CPU FP32 (30.1 vs 70.9 fps) and 1.85× less efficient, so ORT's QDQ int8
+path is a pessimization on this CPU and the NPU's win is the hardware, not the dtype.
+Provider attribution is clean on all three: CPU arms load the cores (+38.7 W), the **iGPU's
+cores fall below idle** (−2.25 W) while its residual takes **+47.09 W**, and the NPU takes
++8.96 W residual for +1.16 W of cores. Medians rather than means, because one transient
+peer burst put phase F's *mean* 8% above phase A's while the medians agree to 0.8%.
+**Carries a retraction:** all four in-study throughput figures were ~half true value —
+`power_probe.py` terminates its workload when sampling ends and the next run started before
+the 95 s hold exited, so two sessions shared one provider. Caught by the NPU's 90.6 fps
+contradicting this repo's documented 5.27 ms latency; re-measured clean at 198.2 fps
+(197.7–198.7 across 12 intervals). The **power phases are unaffected** — each ran exactly
+one workload. Written up in
+[`docs/BENCHMARKS.md`](../../docs/BENCHMARKS.md#joules-per-frame-the-npu-does-113-the-inferences-per-joule-of-the-cpu-59-the-igpu).
+
 **`power_rapl_bf16_gemm_npu_vs_cpu.log`** — the first watt measured in this repo, and it
 moves the headline: on the same bf16 2048³ GEMM the NPU is **1.33× faster and 4.45× more
 energy-efficient** (0.1407 J vs 0.6267 J marginal per GEMM; 122.1 vs 27.4 GFLOPS per

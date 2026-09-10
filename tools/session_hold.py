@@ -24,6 +24,15 @@ array itself is the saturating resource.
 While this runs, in another shell:
     xrt-smi examine -r aie-partitions
 
+`--ep {npu,cpu,dml}` (default npu) makes this double as a STEADY-STATE LOAD GENERATOR for
+`tools/power_probe.py`: the same model held busy on each provider in turn is what turns a
+package-power delta into joules per frame, and the fps_mean printed at the end is the
+divisor. The xrt-smi memory/GOPS sampling describes the NPU only and is skipped for
+cpu/dml, as is `--fresh`'s compile-cache clear.
+
+    python tools/power_probe.py --label B_npu_resnet50 --duration 60 \
+        --command "python tools/session_hold.py --model ... --ep npu --streams 1 --hold 90"
+
 Writes nothing to results/ itself.
 """
 import argparse
@@ -85,15 +94,19 @@ def main():
     ap.add_argument("--xclbin", default=None)
     ap.add_argument("--fresh", action="store_true")
     ap.add_argument("--log", type=int, default=2)
+    ap.add_argument("--ep", choices=("npu", "cpu", "dml"), default="npu",
+                    help="execution provider to hold busy. cpu/dml make this a steady-state "
+                         "load generator for the power probe rather than an NPU contention "
+                         "test; the xrt-smi sampling below is NPU-only and is skipped for them")
     args = ap.parse_args()
 
-    if args.fresh:
+    if args.fresh and args.ep == "npu":
         clear_cache(args.cache_key)
 
-    print(f"building {args.streams} session(s) against {args.model} ...")
+    print(f"building {args.streams} session(s) against {args.model} on {args.ep} ...")
     sessions = []
     for i in range(args.streams):
-        sess = build_session(args.model, "npu", args.cache_key, args.xclbin, log_severity=args.log)
+        sess = build_session(args.model, args.ep, args.cache_key, args.xclbin, log_severity=args.log)
         inp = sess.get_inputs()[0]
         shape = [d if isinstance(d, int) else 1 for d in inp.shape]
         x = np.zeros(shape, dtype=np.float32)
@@ -116,16 +129,23 @@ def main():
     last_total = sum(c[0] for c in counters)
     last_t = time.perf_counter()
     while time.perf_counter() < deadline:
-        mb, gops, _ = sample_memory()
-        mem_samples.append(mb)
-        gops_samples.append(gops)
+        if args.ep == "npu":
+            mb, gops, _ = sample_memory()
+            mem_samples.append(mb)
+            gops_samples.append(gops)
+        else:
+            mb = gops = None  # xrt-smi describes the NPU only
         now = time.perf_counter()
         total = sum(c[0] for c in counters)
         fps = (total - last_total) / (now - last_t)
         fps_samples.append(fps)
         last_total, last_t = total, now
-        print(f"  streams={args.streams}  npu memory: {mb} MB  gops: {gops}  "
-              f"measured completions: {fps:.1f}/s")
+        if args.ep == "npu":
+            print(f"  streams={args.streams}  npu memory: {mb} MB  gops: {gops}  "
+                  f"measured completions: {fps:.1f}/s")
+        else:
+            print(f"  streams={args.streams}  ep={args.ep}  "
+                  f"measured completions: {fps:.1f}/s")
         time.sleep(3.0)
 
     stop_event.set()
@@ -143,6 +163,12 @@ def main():
     if ok_fps:
         print(f"streams={args.streams}  fps_samples={[round(f,1) for f in ok_fps]}  "
               f"fps_mean={sum(ok_fps)/len(ok_fps):.1f}")
+        # The first interval straddles session start-up and reads ~0, which drags the mean
+        # by 1/n. fps_mean is left as-is so older logs stay comparable; the steady figure
+        # below is the one to divide a power delta by.
+        steady = ok_fps[1:] if len(ok_fps) > 1 else ok_fps
+        print(f"streams={args.streams}  fps_mean_steady={sum(steady)/len(steady):.1f}  "
+              f"(first sample dropped, n={len(steady)})")
     print("done.")
 
 
