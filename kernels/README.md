@@ -46,6 +46,7 @@ array program) into `~/.npu/cache/<hash>/`; later runs of the same shape hit the
 | `asm_probe/` | Nothing — asks whether hand-written AIE2 assembly is usable | **It assembles and links.** Only statement-level inline asm fails. Compile only, no NPU |
 | `bank_placement/` | A local copy of `whole_array.py` plus `--stack-size`, and an alternating A/B driver | Tests H12: does separating the int8 GEMM's colliding operands into different memory banks speed it up? **Not resolvable on a shared machine** — seven series, arms overlap, sign varies. Its `bank_stall_probe.py` is a **superseded** control whose headline was retracted; the working observable is `memory_placement/` |
 | `conv_accum/` | Local copies of both 1×1 conv kernels with their accumulators made register-resident | **Worth 2.99–3.01×** (116 → 350 marginal GOPS); hot loop 0.045 → 0.286 MACs/cycle. **The op class stays closed** — CPU still wins 2.4×, down from 7.2× |
+| `w4a8_probe/` | Nothing yet — int4 weights on one core, two ways: native `mmul<int8,int4>`, and int4 widened to int8 on load | **int8×int4 is a native `vmac` on AIE2**, bit-exact, one per cycle at 512 MACs: a k loop at 372.4 MAC/cycle, 1.82× upstream's int8 loop. Widening on load is free and buys only bytes. One core, not the array |
 
 Each kernel's own findings, warnings and retractions follow. They are prose rather than
 table cells because several of them are corrections to what an earlier version of this
@@ -456,3 +457,37 @@ Compiling for the core without IRON needs one non-obvious flag,
 includes `<adf.h>`, which ships with Vitis and is not on this machine. The flag is safe
 because rebuilding `clock_probe`'s source this way reproduces the object IRON itself built,
 bundle for bundle. `results/aie/aie2_isa_static.log`.
+
+## `w4a8_probe/`
+
+What int4 weights cost in one AIE2 core. The W4A8 plan started from `docs/SILICON.md`'s
+"int8×int4 — AIE2p only", so its first step was an unpack to int8; `aie_api` turned out to
+define `aie::mmul<4,16,8,int8,int4>` for AIE2, lowered to int8×int8's own `vmac` builtin with one
+configuration field changed. Two questions, then: does the silicon run that mode, and what does
+the unpack cost. `results/aie/w4a8_probe_npu.log`, written up in
+[`docs/BENCHMARKS.md`](../docs/BENCHMARKS.md#int8int4-is-a-native-vmac-on-aie2-and-int4-weights-cost-nothing-to-store).
+
+- `w4a8_kernels.cc` — a standalone copy loop and unpack loop, and one GEMM-tile template in
+  three B policies (int8 as upstream, int4 widened on load, native int4), each in upstream
+  `mm.cc`'s 4×2 and 2×2 expansions. The int8 policy is upstream's source re-typed: the control.
+- `static_probe.py` — compile only, no NPU: compiles that file and upstream `mm.cc` with the
+  exact Peano command IRON runs, and tabulates each kernel's hardware loop. `--match-cache`
+  proves the command (10 of 10 IRON-built `matmul_i8_i32` objects reproduced bundle for bundle);
+  `--paired` lists each loop's two-load bundles with the pointer roles read off their increments.
+- `w4a8_probe.py` — one Worker, one kernel call bracketed by trace events, verified against an
+  int64 reference, and the IRON object it ran compared with the static compile. `sweep.py` runs
+  the matrix one process per row; `fit.py` fits cycles = a + b·K.
+
+Three things worth knowing before writing another kernel here:
+
+- **An IRON build ignores `aie_kernel_utils.h`'s loop hints.** IRON's compile defines neither
+  `__chess__` nor `__AIECC__`, so every `AIE_LOOP_*` macro is empty there. The native loop only
+  pipelines with its k loop unrolled twice, and that has to be a raw `_Pragma` in the source
+  (`-DINNER_UNROLL2`): 0.5 → 0.8 `vmac` per cycle.
+- **"Spill" in a static table is a schedule shape, not a verdict.** At K=64 the default build of
+  the unpack kernel unrolls fully and spills (1,312-byte frame) and is still faster per call than
+  every int8 arm, because the big loop absorbs the C loads. Measure before believing either way.
+- **A buffer-level bank check misses the pair that costs a cycle here.** Every build puts A, B
+  and C in separate banks, yet most k loops pay one cycle per paired load of two rows of *one*
+  buffer — including upstream's int8 loop, whose single pair reads two A tiles. `--paired` names
+  those; `tools/aie_bank_check.py` cannot.

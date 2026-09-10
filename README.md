@@ -168,10 +168,10 @@ footguns that cost the most time here — is in [`docs/SETUP.md`](docs/SETUP.md)
 
 The XINT8-only ceiling above is the *shipped runtime's*, not the silicon's. AMD's own
 `device.yaml` (bundled with the same 1.7.1 install) gives Phoenix's AIE2 tile spec
-directly: `bfloat16xbfloat16: 128` MACs/cycle, `int16xint8: 128`, `int8xint8: 256`. The
-array natively does bf16; Quark and the VitisAI EP just don't expose it. The open-source
-`mlir-aie`/Peano toolchain does, natively on Windows, with no gated access — so
-`kernels/` holds bf16 and int8 kernels written against the bare array.
+directly: `bfloat16xbfloat16: 128` MACs/cycle, `int16xint8: 128`, `int8xint8: 256` — and
+omits an **int8×int4 `vmac` at 512 the silicon has** (bit-exact; 1.64–1.82× int8 on one
+core). Quark and the VitisAI EP expose none of it; the open-source `mlir-aie`/Peano
+toolchain does, natively on Windows — so `kernels/` holds kernels written against the array.
 
 Outcomes, mostly negative and all measured:
 
